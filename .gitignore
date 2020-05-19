@@ -1,0 +1,8 @@
+*.jpg
+*.pyc
+*.avi
+*.mp4
+data/
+detected/
+address.txt
+venv/

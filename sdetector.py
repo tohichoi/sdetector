@@ -10,7 +10,8 @@ from queue import Queue
 from threading import BoundedSemaphore
 import time
 import copy
-
+from color_model import get_pixel_statistics
+from collections import deque
 
 class Const():
 
@@ -25,6 +26,7 @@ class Const():
     MAX_NHISTORY=20*60 # 1 minute
     VIDEO_WIDTH=-1
     VIDEO_HEIGHT=-1
+    MAX_COLOR_SAMPLES=100
 
     def __init__(self):
         roix=Const.ROI[0]
@@ -68,6 +70,16 @@ class VideoFrame():
     def __init__(self, frame, state=State.UNKNOWN):
         self.frame=frame
         self.state=state
+        self.is_ir=None
+
+    # capture thread 가 아닌 다른 쓰레드에서 호출해야함(성능)
+    def check_ir(self, frame=None):
+        fr=frame if frame is not None else self.frame
+        if self.is_ir is None:
+            stat=get_pixel_statistics(fr, Const.MAX_COLOR_SAMPLES)
+            r=float(len(list(filter(lambda x : x == 0, stat))))/Const.MAX_COLOR_SAMPLES
+            self.is_ir = r > 0.95
+        return self.is_ir
 
 
 class StateManager():
@@ -143,7 +155,7 @@ class MainController():
         # ref_frame
         self.model=model
         self.statemanager=StateManager(self.max_timeline)
-
+        self.prev_frame_ir=False
 
     # def __add_frame_buf(self, frame):
     #     if self.framebuf.full():
@@ -151,9 +163,9 @@ class MainController():
     #     self.framebuf.put(frame)
 
 
-    def __learn(self):
+    def __learn(self, q):
         learner=LearnReference(self.max_learn_frames, self.roi)
-        self.model=learner.learn(self.q)
+        self.model=learner.learn(q)
 
 
     def __determine_action(self, frame, detect_result):
@@ -168,7 +180,7 @@ class MainController():
 
         # build model if necessary
         if self.model == None:
-            self.__learn()
+            self.__learn(self.q)
 
         # fetch frame
         while True:
@@ -180,6 +192,9 @@ class MainController():
 
             try:
                 frame=self.q.get(block=False)
+                vframe=VideoFrame(frame)
+                cur_frame_ir=vframe.check_ir()
+                # print(f'ir: {cur_frame_ir}')
             except queue.Empty:
                 time.sleep(10)
                 continue
@@ -190,8 +205,10 @@ class MainController():
             #    IR histogram
             #    cv2.calcHist, compareHist
             #    if light condition is changed, rebuild model
-            if self.is_light_changed(frame):
-                self.learn(self.q)
+            if self.prev_frame_ir != None and self.prev_frame_ir != cur_frame_ir:
+                print('Video color changed')
+                self.__learn(self.q)
+            self.prev_frame_ir=cur_frame_ir
 
             # self.__add_frame_buf(frame)
 
@@ -203,8 +220,8 @@ class MainController():
             self.__determine_action(frame, detect_result)
 
 
-    def is_light_changed(self, frame):
-        return False
+    def is_color_changed(self, frame):
+        return self.prev_frame_ir != frame.is_ir
 
 
 class SegmentObject():
@@ -361,8 +378,11 @@ class CaptureThread(threading.Thread):
             if frame is None:
                 break
 
-            if not self.q.full():
-                self.q.put(frame)
+            if self.q.full():
+                print('Capture queue is full. dropping previous frame')
+                self.q.get()
+
+            self.q.put(frame)
 
             cv2.imshow(self.vid_src, frame)
             if cv2.waitKey(30)==ord('q'):
@@ -397,7 +417,7 @@ class WriteThread(threading.Thread):
                 videoframe=self.q.get()
                 # time.sleep(10)
                 vcap_out.write(videoframe.frame)
-                print(f'{threading.get_ident()} : {self.q.qsize()}')
+                # print(f'{threading.get_ident()} : {self.q.qsize()}')
             vcap_out.release()
             # write_event.clear()
             print(f'{threading.get_ident()} write_framebuf finished')
@@ -442,7 +462,36 @@ class LearnReference():
         return ret
 
 
-    def learn(self, q):
+    def wait_for_stable(self, q):
+        prev_frame=None
+        is_first=True
+        maxlen=20
+        dq=deque([], maxlen)
+        nskip=5
+        while True:
+            frame=q.get()
+            if is_first:
+                prev_frame=frame
+                is_first=False
+                continue
+            if nskip % 5 == 0:
+                dq.append(((frame - prev_frame) ** 2).mean(axis=None))
+                prev_frame=frame
+                # print('fetch frame')
+            if len(dq) == maxlen:
+                v=np.var(dq)
+                print(f'wait_for_stable : {v}')
+                if v < 5.0:
+                    return
+            nskip+=1
+
+
+    def learn(self, q, wait_until_stable=True):
+
+        if wait_until_stable:
+            self.wait_for_stable(q)
+
+        print('learning ... ', end='')
         ref_count=0
         while ref_count < self.n:
             frame=q.get()
@@ -454,12 +503,14 @@ class LearnReference():
             frame_gray=SegmentObject.get_gray_image(frame[y:y+h, x:x+w])
 
             ref_count+=1
-            print(f'ref_count={ref_count}/{self.n}')
+            # print(f'ref_count={ref_count}/{self.n}')
             if ref_count == 1:
                 ref_frame=frame_gray
                 continue
             
             ref_frame=LearnReference.update_ref_frame(ref_frame, frame_gray, 1./ref_count)
+
+        print('done')
 
         return ref_frame
 
@@ -471,9 +522,9 @@ class LearnReference():
 
 if __name__ == '__main__':
 
-    # addr='act1.avi'
-    with open('address.txt') as fd:
-        addr=fd.readline().strip()
+    addr='act3.avi'
+    # with open('address.txt') as fd:
+    #     addr=fd.readline().strip()
 
     # model from file
     # ref='ref1.mp4'

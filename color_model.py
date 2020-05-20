@@ -47,13 +47,13 @@ def get_pixel_statistics(img, nsamples):
         for i in range(len(epx)-1):
             d+=abs(epx[i]-epx[i+1])
         var.append(d)
+        # var.append(np.var(px)+10e-5)
 
     return var
     
 
+def read_images(filelist):
 
-# filelist: './ccd.txt' or './ir.txt'
-def learn(filelist, show_dist=True):
     data=[]
     with open(filelist) as fd:
         for line in fd.readlines():
@@ -68,15 +68,23 @@ def learn(filelist, show_dist=True):
             img=read_image(filename)
             data=data+get_pixel_statistics(img, 200)
 
+    return data
+
+
+# filelist: './ccd.txt' or './ir.txt'
+def learn(filelist, show_dist=True):
+
+    data=read_images(filelist)
+
     location, scale=norm.fit(data)
-    print(f'normal distribution : mean={location:.2f} stddev={scale:.2f}')
+    print(f'normal distribution : location={location:.2f} scale={scale:.2f}')
     if show_dist:
         show_distribution(data, norm.pdf, 'r', *(location, scale))
     
-    location, scale=expon.fit(data)
-    print(f'exponential distribution : mean={location:.2f} stddev={scale:.2f}')
-    if show_dist:
-        show_distribution(data, expon.pdf, 'g', *(location, scale))
+    # location, scale=expon.fit(data, floc=0)
+    # print(f'exponential distribution : location={location:.2f} scale={scale:.2f}')
+    # if show_dist:
+    #     show_distribution(data, expon.pdf, 'g', *(location, 1/scale))
 
     shape, location, scale = skewnorm.fit(data)
     print(f'skewed normal distribution : shape={shape:.2f} location={location:.2f} scale={scale:.2f}')
@@ -104,9 +112,9 @@ if __name__ == '__main__':
     # plt.subplot(1, 2, 2)
     # plt.imshow(ir_img)
     # plt.show()
-    plt.subplot(1, 2, 1)
-    plt.title('ir')
-    learn('./ir.txt', True)
+    # plt.subplot(1, 2, 1)
+    # plt.title('ir')
+    # learn('./ir.txt', True)
     plt.subplot(1, 2, 2)
     plt.title('ccd')
     learn('./ccd.txt', True)

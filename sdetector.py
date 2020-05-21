@@ -12,6 +12,13 @@ import time
 import copy
 from color_model import get_pixel_statistics
 from collections import deque
+from matplotlib import pyplot as plt
+import collections
+from telegram.ext import Updater
+import logging
+from telegram.ext import CommandHandler
+
+
 
 class Const():
 
@@ -29,7 +36,7 @@ class Const():
     VIDEO_WIDTH=-1
     VIDEO_HEIGHT=-1
     MAX_COLOR_SAMPLES=100
-    WAITKEY_MS=20
+    WAITKEY_MS=50
 
     def __init__(self):
         roix=Const.ROI[0]
@@ -68,6 +75,8 @@ class VideoFrame():
     def __init__(self, frame, state=State.UNKNOWN):
         self.frame=frame
         self.state=state
+        self.msec=0
+        self.iframes=0
         self.is_ir=None
 
     # capture thread 가 아닌 다른 쓰레드에서 호출해야함(성능)
@@ -107,7 +116,7 @@ class StateManager():
                     print(f'thread : {t.name} is alive')
 
 
-    def update_state(self, frame, detect_result):
+    def update_state(self, frame, roi_frame, model, alpha, detect_result):
         if len(self.framebuf) == 0:
             self.framebuf.append(VideoFrame(frame, State.UNKNOWN))
 
@@ -118,6 +127,7 @@ class StateManager():
         next_state=State.UNKNOWN
 
         if cur_state==State.UNKNOWN or cur_state==State.ABSENT:
+            model=LearnModel.update_model(model, roi_frame, alpha)
             next_state = State.ENTERED if detect_result else State.ABSENT
         elif cur_state==State.ENTERED:
             next_state = State.PRESENT if detect_result else State.ABSENT
@@ -138,11 +148,12 @@ class StateManager():
 
         self.framebuf.append(VideoFrame(frame, next_state))
 
+        return model
 
 class MainController():
 
     def __init__(self, vid_src, model=None):
-        self.q=Queue(Const.MAX_CAPTURE_BUFFER)
+        self.q=collections.deque([], maxlen=Const.MAX_CAPTURE_BUFFER)
         self.max_timeline=Const.MAX_TIMELINE
         self.max_learn_frames=Const.MAX_LEARN_FRAMES
         self.vid_src=vid_src
@@ -152,17 +163,26 @@ class MainController():
         self.capture_started_event.clear()
         self.capture_thread=None
         self.model=model
+        self.alpha=1
         self.statemanager=StateManager(self.max_timeline)
         self.prev_frame_ir=False
 
+    def __create_image_window(self):
+        nw, nh=(int(Const.VIDEO_WIDTH*0.5), int(Const.VIDEO_HEIGHT*0.5))
+        wn=[self.vid_src, 'Model', 'Detector']
+        off=[(0, 0), (1, 0), (2, 0)]
+        for i, w in enumerate(wn):
+            cv2.namedWindow(w, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(w, nw, nh)
+            cv2.moveWindow(w, off[i][0]*nw, off[i][1]*nh)
 
     def __learn(self, q):
         learner=LearnModel(self.max_learn_frames)
-        self.model=learner.learn(q, q_window_name=self.vid_src)
+        self.model, self.alpha=learner.learn(q, q_window_name=None)
 
 
-    def __determine_action(self, frame, detect_result):
-        self.statemanager.update_state(frame, detect_result)
+    def __determine_action(self, frame, roi_frame, detect_result):
+        self.model=self.statemanager.update_state(frame, roi_frame, self.model, self.alpha, detect_result)
 
 
     def run(self):
@@ -174,6 +194,8 @@ class MainController():
 
         print('Waiting for capture starting')
         self.capture_started_event.wait()
+
+        # self.__create_image_window()
 
         # build model if necessary
         if self.model == None:
@@ -189,15 +211,20 @@ class MainController():
                 break
 
             try:
-                frame=self.q.get()
-                vframe=VideoFrame(frame)
+                vframe=self.q.popleft()
+                frame=vframe.frame
                 cur_frame_ir=vframe.check_ir()
 
-                cv2.imshow(self.vid_src, frame)
-                if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
-                    break
+                # plt.subplot(1, 3, 1)
+                # cv2.imshow(self.vid_src, frame)
+                # plt.show()
+
+                # if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
+                #     print('Stopping capture')
+                #     self.stop_event.set()
+                #     continue
                 # print(f'ir: {cur_frame_ir}')
-            except queue.Empty:
+            except IndexError:
                 time.sleep(0.1)
                 continue
 
@@ -214,12 +241,15 @@ class MainController():
 
             # detect object
             detector=ObjectDetector(self.model, frame)
-            detect_result=detector.detect(draw_frame=frame)
+            detect_result=detector.detect(draw_frame=vframe)
 
-            cv2.imshow("detector", frame)
+            # plt.subplot(1, 3, 3)
+            cv2.imshow("Detector", frame)
+            # plt.show()
             if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
+                self.stop_event.set()
                 break
-            self.__determine_action(frame, detect_result)
+            self.__determine_action(frame, detector.roi_frame, detect_result)
 
 
     def is_color_changed(self, frame):
@@ -235,6 +265,7 @@ class SegmentObject():
     def segment(self):
         frame_gray, difference, mask=self.__process_image(self.frame)
         self.contours=self.__find_contours(mask, lambda x : x + (self.roi[0], self.roi[1]))
+        return frame_gray, difference, mask
 
     @staticmethod
     def get_gray_image(frame):
@@ -284,12 +315,15 @@ class ObjectDetector(SegmentObject):
     def __init__(self, ref_frame, frame):
         super(ObjectDetector, self).__init__(ref_frame, frame)
         self.contours=None
+        self.roi_frame=None
 
+
+    # draw_frame : VideoFrame
     def detect(self, draw_frame=None):
-        self.segment()
+        self.roi_frame, difference, mask=self.segment()
         ious, sumiou, maxiou=self.__find_iou(self.contours)
 
-        if draw_frame.any():
+        if draw_frame:
             self.__draw(draw_frame, ious)
 
         if maxiou > 0.08:
@@ -312,7 +346,8 @@ class ObjectDetector(SegmentObject):
         return (iou, sumiou, maxiou)
 
 
-    def __draw(self, frame, ious):
+    def __draw(self, vframe, ious):
+        frame=vframe.frame
         maxiou=0
         padding=25
         maxheight=1000
@@ -326,7 +361,8 @@ class ObjectDetector(SegmentObject):
             cv2.putText(frame, f"{iou:.2f}", (x0, y0-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, clr)
         cv2.drawContours(frame, self.contours, -1, (0, 255, 0), 3)
         cv2.rectangle(frame, (Const.ROI[0], Const.ROI[1]), (Const.ROI[2], Const.ROI[3]), (220, 220, 220), 2)
-
+        cv2.putText(frame, f'msec: {vframe.msec/1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
+        cv2.putText(frame, f'iframes: {vframe.iframes}', (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
 
     def __bb_intersection_over_union(self, boxA, boxB):
         # determine the (x, y)-coordinates of the intersection rectangle
@@ -370,6 +406,7 @@ class CaptureThread(threading.Thread):
         Const.VIDEO_WIDTH=int(vcap_act.get(3))
         Const.VIDEO_HEIGHT=int(vcap_act.get(4))
 
+        # frame_skipped=False        
         while not self.stop_event.wait(0.001):
             ret, frame = vcap_act.read()
             if not(ret):
@@ -378,16 +415,30 @@ class CaptureThread(threading.Thread):
                 continue
 
             if frame is None:
+                self.capture_started_event.clear()
                 break
 
-            if self.q.full():
+            # if not frame_skipped:
+            #     frame_skipped=True
+            #     continue
+
+            # if len(self.q)==self.q.maxlen:
                 # print('Capture queue is full. dropping previous frame')
-                self.q.get()
-                time.sleep(0.1)
+                # self.q.get()
+                # time.sleep(0.1)
 
             s=datetime.datetime.now().isoformat()
-            cv2.putText(frame, f"{s}", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0))
-            self.q.put(frame)
+            cv2.putText(frame, f"{s}", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
+            vframe=VideoFrame(frame)
+
+            vframe.iframes=vcap_act.get(cv2.CAP_PROP_POS_FRAMES)
+            vframe.msec=vcap_act.get(cv2.CAP_PROP_POS_MSEC)
+
+            if vframe.msec > 0:
+                fps = vframe.iframes / (vframe.msec / 1000.)
+                # print(f'fps: {fps}')
+            
+            self.q.append(vframe)
 
         vcap_act.release()
 
@@ -422,6 +473,7 @@ class WriteThread(threading.Thread):
             vcap_out.release()
             # write_event.clear()
             print(f'{threading.get_ident()} write_framebuf finished')
+            send_detected_video(fn)
 
 
 class LearnModel():
@@ -441,7 +493,7 @@ class LearnModel():
         th=CaptureThread(name="CaptureThread", args=(q, vid_src, event))
         th.start()
 
-        ret=self.learn(q, q_window_name=vid_src)
+        ret=self.learn(q, q_window_name=None)
         event.set()
         th.join(5000)
         print(f'Waiting for {th.name} terminate...')
@@ -459,9 +511,17 @@ class LearnModel():
         dq=deque([], maxlen)
         nskip=1
         while True:
-            frame=q.get()
+            try:
+                vframe=q.popleft()
+                frame=vframe.frame
+            except IndexError:
+                time.sleep(0.1)
+                continue
+
             if q_window_name:
+                # plt.subplot(1, 3, 1)
                 cv2.imshow(q_window_name, frame)
+                # plt.show()
                 if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
                     break
 
@@ -475,8 +535,8 @@ class LearnModel():
                 # print('fetch frame')
             if len(dq) == maxlen:
                 v=np.var(dq)
-                if v < 20.0:
-                    print(f'wait_for_stable : {v}')
+                print(f'wait_for_stable : {v}')
+                if v < 40.0:
                     return
             nskip+=1
 
@@ -489,14 +549,15 @@ class LearnModel():
 
         print('learning ... ', end='')
         ref_count=0
+        alpha=0
         model_frame=None
         while ref_count < self.n:
-            if q.empty():
+            try:
+                vframe=q.popleft()
+                frame=vframe.frame
+            except IndexError:
                 time.sleep(0.1)
                 continue
-
-            frame=q.get()
-
             roi_frame=get_roi_frame(frame)
             frame_gray=SegmentObject.get_gray_image(roi_frame)
 
@@ -506,28 +567,56 @@ class LearnModel():
                 model_frame=frame_gray
                 continue
             
-            model_frame=LearnModel.update_ref_frame(model_frame, frame_gray, 1./ref_count)
+            alpha=1./ref_count
+            model_frame=LearnModel.update_model(model_frame, frame_gray, alpha)
             if q_window_name:
+                # plt.subplot(1, 3, 1)
                 cv2.imshow(q_window_name, frame)
-            cv2.imshow('Model', model_frame.astype('uint8'))
-            if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
-                break
+                # plt.subplot(1, 3, 2)
+                cv2.imshow('Model', model_frame.astype('uint8'))
+                # plt.show()
+                if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
+                    break
 
         print('done')
 
-        return model_frame
+        return model_frame, alpha
 
 
     @staticmethod
-    def update_ref_frame(ref_frame, new_frame, alpha):
-        return alpha*new_frame+(1-alpha)*ref_frame
+    def update_model(model_frame, new_frame, alpha):
+        return alpha*new_frame+(1-alpha)*model_frame
 
 
+def callback_job(context: telegram.ext.CallbackContext):
+    context.bot.send_video(chat_id='@examplechannel', 
+                             text='One message every minute')
+
+def monitor(context, update):
+    fn=''
+    context.bot.send_video(chat_id=update.effective_chat.id, video=open(fn, 'rb'))
+
+
+def monitor(update, context):
+    bio = BytesIO()
+    bio.name='20200522T002004.mp4'
+
+    fn='detected/20200522T002004.mp4'
+    context.bot.send_video(chat_id=update.effective_chat.id,
+        video=open(fn, 'rb'))
+        
 if __name__ == '__main__':
 
-    addr='act3.avi'
-    # with open('address.txt') as fd:
-    #     addr=fd.readline().strip()
+    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                     level=logging.INFO)
+
+    # addr='act3.avi'
+    with open('address.txt') as fd:
+        addr=fd.readline().strip()
+
+    token=''
+    with open('bot_token.txt') as fd:
+        token=fd.readline().strip()
 
     # model from file
     # ref='ref1.mp4'
@@ -540,4 +629,18 @@ if __name__ == '__main__':
 
     controller.run()
 
-    
+    updater = Updater(token=token, use_context=True)
+    dispatcher = updater.dispatcher
+
+    start_handler = CommandHandler('start', start)
+    dispatcher.add_handler(start_handler)
+
+    monitor_handler = CommandHandler('monitor', monitor)
+    dispatcher.add_handler(monitor_handler)
+
+    j = updater.job_queue
+    j.run_once(callback_job)
+
+
+    updater.start_polling()
+    updater.idle()

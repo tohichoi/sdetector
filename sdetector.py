@@ -15,18 +15,21 @@ from collections import deque
 
 class Const():
 
-    MAX_CAPTURE_BUFFER=20*5
-    MAX_TIMELINE=2*20
-    MAX_LEARN_FRAMES=100
+    FPS=20
+    # 20 frames/sec * 30sec
+    MAX_CAPTURE_BUFFER=FPS*30
+    MAX_TIMELINE=2*FPS
+    MAX_LEARN_FRAMES=FPS*2
     ROI=[444, 0, 1055, 690]
     roix=0
     roiy=0
     roiw=0
     roih=0
-    MAX_NHISTORY=20*60 # 1 minute
+    MAX_NHISTORY=FPS*60 # 1 minute
     VIDEO_WIDTH=-1
     VIDEO_HEIGHT=-1
     MAX_COLOR_SAMPLES=100
+    WAITKEY_MS=20
 
     def __init__(self):
         roix=Const.ROI[0]
@@ -46,24 +49,19 @@ class State(Enum):
 def show_image(img):
     title='temp'
     cv2.imshow(title, img)
-    cv2.waitKey(0)
+    cv2.waitKey(Const.WAITKEY_MS)
     cv2.destroyWindow(title)
-    cv2.waitKey(1)
+    cv2.waitKey(Const.WAITKEY_MS)
 
 
-class Roi():
-    def __init__(self, roi=[0, 0, 0, 0]):
-        self.x0=roi[0]
-        self.y0=roi[1]
-        self.x1=roi[2]
-        self.y1=roi[3]
-        self.width=roi[2]-roi[0]
-        self.height=roi[3]-roi[1]
-    
+def get_roi_frame(frame):
 
-# class Action(Enum):
-#     NOOP=0
-#     WRITE_VIDEO=1
+    x=Const.ROI[0]
+    y=Const.ROI[1]
+    w=Const.ROI[2]-x
+    h=Const.ROI[3]-y
+
+    return frame[y:y+h, x:x+w]
 
 
 class VideoFrame():
@@ -97,14 +95,14 @@ class StateManager():
     def stop_writing_thread(self):
         exitthreadcount=0
         for i, t in enumerate(self.threadlist):
-            t.join(20)
+            t.join(Const.FPS)
             if not t.is_alive():
                 exitthreadcount+=1
                 print(f'thread exited : {t.name} {i}/{len(self.threadlist)}')
 
         if exitthreadcount != len(self.threadlist):
             for i, t in enumerate(self.threadlist):
-                t.join(20)
+                t.join(Const.FPS)
                 if t.is_alive():
                     print(f'thread : {t.name} is alive')
 
@@ -147,25 +145,20 @@ class MainController():
         self.q=Queue(Const.MAX_CAPTURE_BUFFER)
         self.max_timeline=Const.MAX_TIMELINE
         self.max_learn_frames=Const.MAX_LEARN_FRAMES
-        self.roi=Const.ROI
         self.vid_src=vid_src
         self.stop_event=threading.Event()
         self.stop_event.clear()
+        self.capture_started_event=threading.Event()
+        self.capture_started_event.clear()
         self.capture_thread=None
-        # ref_frame
         self.model=model
         self.statemanager=StateManager(self.max_timeline)
         self.prev_frame_ir=False
 
-    # def __add_frame_buf(self, frame):
-    #     if self.framebuf.full():
-    #         self.framebuf.get()
-    #     self.framebuf.put(frame)
-
 
     def __learn(self, q):
-        learner=LearnReference(self.max_learn_frames, self.roi)
-        self.model=learner.learn(q)
+        learner=LearnModel(self.max_learn_frames)
+        self.model=learner.learn(q, q_window_name=self.vid_src)
 
 
     def __determine_action(self, frame, detect_result):
@@ -175,11 +168,16 @@ class MainController():
     def run(self):
 
         # create capture thread
-        self.capture_thread=CaptureThread(name='CaptureThread', args=(self.q, self.vid_src, self.stop_event))
+        self.capture_thread=CaptureThread(name='CaptureThread', 
+            args=(self.q, self.vid_src, self.stop_event, self.capture_started_event))
         self.capture_thread.start()
+
+        print('Waiting for capture starting')
+        self.capture_started_event.wait()
 
         # build model if necessary
         if self.model == None:
+            print('Building model ...')
             self.__learn(self.q)
 
         # fetch frame
@@ -191,12 +189,16 @@ class MainController():
                 break
 
             try:
-                frame=self.q.get(block=False)
+                frame=self.q.get()
                 vframe=VideoFrame(frame)
                 cur_frame_ir=vframe.check_ir()
+
+                cv2.imshow(self.vid_src, frame)
+                if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
+                    break
                 # print(f'ir: {cur_frame_ir}')
             except queue.Empty:
-                time.sleep(10)
+                time.sleep(0.1)
                 continue
 
             # check if CCD switched to IR or vice versa
@@ -210,13 +212,13 @@ class MainController():
                 self.__learn(self.q)
             self.prev_frame_ir=cur_frame_ir
 
-            # self.__add_frame_buf(frame)
-
             # detect object
-            detector=ObjectDetector(self.model, frame, self.roi)
+            detector=ObjectDetector(self.model, frame)
             detect_result=detector.detect(draw_frame=frame)
+
             cv2.imshow("detector", frame)
-            cv2.waitKey(30)
+            if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
+                break
             self.__determine_action(frame, detect_result)
 
 
@@ -245,11 +247,8 @@ class SegmentObject():
     def __process_image(self, frame):
 
         # cv2.putText(frame, "sequence: ", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, 255)
-        x=self.roi[0]
-        y=self.roi[1]
-        w=self.roi[2]-x
-        h=self.roi[3]-y
-        frame_gray=SegmentObject.get_gray_image(frame[y:y+h, x:x+w])
+        roi_frame=get_roi_frame(frame)
+        frame_gray=SegmentObject.get_gray_image(roi_frame)
         difference=cv2.absdiff(self.ref_frame.astype('uint8'), frame_gray)
         # print(f'sum(difference): {np.sum(difference)}')
         # cv2.imshow('difference:absdiff', difference)
@@ -282,7 +281,7 @@ class SegmentObject():
 
 
 class ObjectDetector(SegmentObject):
-    def __init__(self, ref_frame, frame, roi):
+    def __init__(self, ref_frame, frame):
         super(ObjectDetector, self).__init__(ref_frame, frame)
         self.contours=None
 
@@ -318,15 +317,15 @@ class ObjectDetector(SegmentObject):
         padding=25
         maxheight=1000
         for i, (con, iou) in enumerate(zip(self.contours, ious)):
-            x0=self.roi[0]+(padding+50)*i
-            y0=self.roi[3]-int(maxheight*iou)
+            x0=Const.ROI[0]+(padding+50)*i
+            y0=Const.ROI[3]-int(maxheight*iou)
             x1=x0+50
-            y1=self.roi[3]
+            y1=Const.ROI[3]
             clr=(255-i*(255/len(self.contours)), 0, 0)
             cv2.rectangle(frame, (x0, y0), (x1, y1), clr, -1)
             cv2.putText(frame, f"{iou:.2f}", (x0, y0-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, clr)
         cv2.drawContours(frame, self.contours, -1, (0, 255, 0), 3)
-        cv2.rectangle(frame, (self.roi[0], self.roi[1]), (self.roi[2], self.roi[3]), (220, 220, 220), 2)
+        cv2.rectangle(frame, (Const.ROI[0], Const.ROI[1]), (Const.ROI[2], Const.ROI[3]), (220, 220, 220), 2)
 
 
     def __bb_intersection_over_union(self, boxA, boxB):
@@ -359,11 +358,14 @@ class CaptureThread(threading.Thread):
         self.q=args[0]
         self.vid_src=args[1]
         self.stop_event=args[2]
+        self.capture_started_event=args[3]
+
 
     def run(self):
         print('connecting to device ...')
         vcap_act = cv2.VideoCapture(self.vid_src)
         print('connected ...')
+        self.capture_started_event.set()
 
         Const.VIDEO_WIDTH=int(vcap_act.get(3))
         Const.VIDEO_HEIGHT=int(vcap_act.get(4))
@@ -379,14 +381,13 @@ class CaptureThread(threading.Thread):
                 break
 
             if self.q.full():
-                print('Capture queue is full. dropping previous frame')
+                # print('Capture queue is full. dropping previous frame')
                 self.q.get()
+                time.sleep(0.1)
 
+            s=datetime.datetime.now().isoformat()
+            cv2.putText(frame, f"{s}", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0))
             self.q.put(frame)
-
-            cv2.imshow(self.vid_src, frame)
-            if cv2.waitKey(30)==ord('q'):
-                break
 
         vcap_act.release()
 
@@ -411,7 +412,7 @@ class WriteThread(threading.Thread):
 
         with self.sema:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')    
-            vcap_out = cv2.VideoWriter(fn, fourcc, 20.0, (Const.VIDEO_WIDTH, Const.VIDEO_HEIGHT))
+            vcap_out = cv2.VideoWriter(fn, fourcc, Const.FPS, (Const.VIDEO_WIDTH, Const.VIDEO_HEIGHT))
 
             while not self.q.empty():
                 videoframe=self.q.get()
@@ -423,14 +424,9 @@ class WriteThread(threading.Thread):
             print(f'{threading.get_ident()} write_framebuf finished')
 
 
-class LearnReference():
-    def __init__(self, max_learn_frames, roi):
+class LearnModel():
+    def __init__(self, max_learn_frames):
         self.n=max_learn_frames
-        self.roi=roi
-        self.roix=self.roi[0]
-        self.roiy=self.roi[1]
-        self.roiw=self.roi[2]-self.roix
-        self.roih=self.roi[3]-self.roiy
 
 
     def learn_from_file(self, filepath):
@@ -439,19 +435,13 @@ class LearnReference():
         if not os.path.exists(filepath):
             return None
 
-        # print('connecting to device ...')
-        # vcap_ref = cv2.VideoCapture(vid_src)
-        # width=int(vcap_ref.get(3))
-        # height=int(vcap_ref.get(4))
-        # print('connected ...')
-
         event=threading.Event()
         event.clear()
         q=Queue()
         th=CaptureThread(name="CaptureThread", args=(q, vid_src, event))
         th.start()
 
-        ret=self.learn(q)
+        ret=self.learn(q, q_window_name=vid_src)
         event.set()
         th.join(5000)
         print(f'Waiting for {th.name} terminate...')
@@ -462,14 +452,19 @@ class LearnReference():
         return ret
 
 
-    def wait_for_stable(self, q):
+    def wait_for_stable(self, q, q_window_name=None):
         prev_frame=None
         is_first=True
-        maxlen=20
+        maxlen=50
         dq=deque([], maxlen)
-        nskip=5
+        nskip=1
         while True:
             frame=q.get()
+            if q_window_name:
+                cv2.imshow(q_window_name, frame)
+                if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
+                    break
+
             if is_first:
                 prev_frame=frame
                 is_first=False
@@ -480,39 +475,47 @@ class LearnReference():
                 # print('fetch frame')
             if len(dq) == maxlen:
                 v=np.var(dq)
-                print(f'wait_for_stable : {v}')
-                if v < 5.0:
+                if v < 20.0:
+                    print(f'wait_for_stable : {v}')
                     return
             nskip+=1
 
 
-    def learn(self, q, wait_until_stable=True):
+    def learn(self, q, q_window_name=None, wait_until_stable=True):
 
         if wait_until_stable:
-            self.wait_for_stable(q)
+            print('Waiting for scene stable')
+            self.wait_for_stable(q, q_window_name)
 
         print('learning ... ', end='')
         ref_count=0
+        model_frame=None
         while ref_count < self.n:
+            if q.empty():
+                time.sleep(0.1)
+                continue
+
             frame=q.get()
-            
-            x=self.roi[0]
-            y=self.roi[1]
-            w=self.roi[2]-x
-            h=self.roi[3]-y
-            frame_gray=SegmentObject.get_gray_image(frame[y:y+h, x:x+w])
+
+            roi_frame=get_roi_frame(frame)
+            frame_gray=SegmentObject.get_gray_image(roi_frame)
 
             ref_count+=1
             # print(f'ref_count={ref_count}/{self.n}')
             if ref_count == 1:
-                ref_frame=frame_gray
+                model_frame=frame_gray
                 continue
             
-            ref_frame=LearnReference.update_ref_frame(ref_frame, frame_gray, 1./ref_count)
+            model_frame=LearnModel.update_ref_frame(model_frame, frame_gray, 1./ref_count)
+            if q_window_name:
+                cv2.imshow(q_window_name, frame)
+            cv2.imshow('Model', model_frame.astype('uint8'))
+            if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
+                break
 
         print('done')
 
-        return ref_frame
+        return model_frame
 
 
     @staticmethod

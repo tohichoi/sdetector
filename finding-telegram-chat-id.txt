@@ -1,0 +1,19 @@
+
+Assume the bot name is my_bot.
+
+1- Add the bot to the group.
+Go to the group, click on group name, click on Add members, in the searchbox search for your bot like this: @my_bot, select your bot and click add.
+
+2- Send a dummy message to the bot.
+You can use this example: /my_id @my_bot
+(I tried a few messages, not all the messages work. The example above works fine. Maybe the message should start with /)
+
+3- Go to following url: https://api.telegram.org/botXXX:YYYY/getUpdates
+replace XXX:YYYY with your bot token
+
+4- Look for "chat":{"id":-zzzzzzzzzz,
+-zzzzzzzzzz is your chat id (with the negative sign).
+
+5- Testing: You can test sending a message to the group with a curl:
+
+curl -X POST "https://api.telegram.org/botXXX:YYYY/sendMessage" -d "chat_id=-zzzzzzzzzz&text=my sample text"

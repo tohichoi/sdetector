@@ -195,7 +195,7 @@ class StateManager():
             self.nhistory+=1
         # PRESENT -> ABSENT
         elif self.prev_state >= T and self.cur_state < T:
-            if len(self.framebuf) > 50:
+            # if len(self.framebuf) > 50:
 
             q=Queue(len(self.framebuf))
             for item in self.framebuf:

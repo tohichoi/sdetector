@@ -20,6 +20,8 @@ import logging
 from telegram.ext import CommandHandler
 import json
 from pomegranate import *
+import sys
+import random
 
 
 class Config():
@@ -39,9 +41,12 @@ class Config():
     WAITKEY_MS=50
     TG_CHAT_ID=None
     TG_TOKEN=None
-    MAX_IOU=0.08
+    MAX_IOU=0.02
     send_video=False
     statemodel=None
+    imagemodel=None
+    video_src=None
+
 
     tg_video_q=Queue()
     tg_bot=None
@@ -54,6 +59,15 @@ class State():
     PRESENT=3
     LEFT=4
 
+
+def width(roi):
+    return roi[2]-roi[0]
+
+def height(roi):
+    return roi[3]-roi[1]
+
+def area(roi):
+    return width(roi)*height(roi)
 
 def show_image(img):
     title='temp'
@@ -72,6 +86,45 @@ def get_roi_frame(frame):
 
     return frame[y:y+h, x:x+w]
 
+
+def show_frame(org=None, detect=None, model=None, difference=None, waitKey=True):
+
+    if org is not None:
+        cv2.imshow(Config.video_src, org)
+    if detect is not None:
+        cv2.imshow('Detector', detect)
+    if model is not None:
+        cv2.imshow('Model', model)
+    if difference is not None:
+        cv2.imshow('Difference', difference)
+
+    if waitKey and cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+        return False
+
+    return True
+
+
+def create_image_window():
+    scale=0.4
+    margin=50
+    nw, nh=(int(Config.VIDEO_WIDTH*scale), int(Config.VIDEO_HEIGHT*scale))
+    rnw, rnh=(int(width(Config.ROI)*scale), int(height(Config.ROI)*scale))
+    wn=[Config.video_src, 'Detector', 'Model', 'Difference']
+    cv2.namedWindow(wn[0], cv2.WINDOW_NORMAL)
+    cv2.moveWindow(wn[0], 0, 0)
+    cv2.resizeWindow(wn[0], nw, nh)
+
+    cv2.namedWindow(wn[1], cv2.WINDOW_NORMAL)
+    cv2.moveWindow(wn[1], nw+margin, 0)
+    cv2.resizeWindow(wn[1], nw, nh)
+
+    cv2.namedWindow(wn[2], cv2.WINDOW_NORMAL)
+    cv2.moveWindow(wn[2], 0, nh+margin)
+    cv2.resizeWindow(wn[2], rnw, rnh)
+
+    cv2.namedWindow(wn[3], cv2.WINDOW_NORMAL)
+    cv2.moveWindow(wn[3], rnw+margin, rnh+margin)
+    cv2.resizeWindow(wn[3], rnw, rnh)
 
 class VideoFileMerger():
     def __init__(self, q):
@@ -128,6 +181,29 @@ class VideoFrame():
         return self.is_ir
 
 
+class ImageModel():
+    def __init__(self, pixel=None, feature=None):
+        # average value of each pixel (ROI size)
+        self.pixel=pixel
+        # self.histogram=None
+        # histogram extreme pionts
+        if pixel is not None and feature is None:
+            self.feature=ImageModel.extract_feature(self.pixel)
+        else:
+            self.feature=feature
+        self.alpha=1
+
+    # frame: gray scale
+    @staticmethod
+    def extract_feature(frame):
+        hist1, bins=np.histogram(frame.flatten(), 64, [0, 256])
+        wlen=3
+        T=1./wlen
+        w=np.ones(wlen)
+        pseq=np.convolve(w/w.sum(), hist1, mode='same')
+        return pseq
+
+
 class StateManager():
     def __init__(self, statemodel, nhistory):
         self.max_nhistory=Config.MAX_NHISTORY
@@ -158,7 +234,7 @@ class StateManager():
                     print(f'thread : {t.name} is alive')
 
 
-    def update_state(self, frame, roi_frame, imagemodel, alpha, new_state):
+    def update_state(self, frame, roi_frame, imagemodel, new_state):
         # if len(self.framebuf) < self.nhistory:
         #     self.framebuf.append(VideoFrame(frame, new_state))
         #     # imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
@@ -186,7 +262,8 @@ class StateManager():
 
         # ABSENT -> ABSENT
         if self.prev_state < T and self.cur_state < T:
-            imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
+            imageinstance=ImageModel(roi_frame, None)
+            imagemodel=LearnModel.update_model(imagemodel, imageinstance)
         # ABSENT -> PRESENT
         elif self.prev_state < T and self.cur_state >= T:
             self.nhistory+=1
@@ -212,11 +289,10 @@ class StateManager():
 
 class MainController():
 
-    def __init__(self, vid_src, statemodel=None, imagemodel=None):
+    def __init__(self, statemodel=None, imagemodel=None):
         self.q=collections.deque([], maxlen=Config.MAX_CAPTURE_BUFFER)
         self.max_timeline=Config.MAX_TIMELINE
         self.max_learn_frames=Config.MAX_LEARN_FRAMES
-        self.vid_src=vid_src
         self.stop_event=threading.Event()
         self.stop_event.clear()
         self.capture_started_event=threading.Event()
@@ -228,39 +304,44 @@ class MainController():
         self.prev_frame_ir=None
 
 
-    def __create_image_window(self):
-        scale=0.4
-        margin=20
-        nw, nh=(int(Config.VIDEO_WIDTH*scale), int(Config.VIDEO_HEIGHT*scale))
-        wn=[self.vid_src, 'Detector', 'Model']
-        dim=[(nw, nh), (nw, nh), (int((Config.ROI[2]-Config.ROI[0])*scale), int((Config.ROI[3]-Config.ROI[1])*scale))]
-        off=[(0, 0), (dim[0][0]+margin, 0), (dim[0][0]+dim[1][0]+2*margin, 0)]
-        for i, w in enumerate(wn):
-            cv2.namedWindow(w, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(w, dim[i][0], dim[i][1])
-            cv2.moveWindow(w, off[i][0], off[i][1])
+        # dim=[(nw, nh), 
+        #     (nw, nh), 
+        #     (int(width(Config.ROI)*scale), int(height(Config.ROI)*scale)),
+        #     (int(width(Config.ROI)*scale), int(height(Config.ROI)*scale))
+        #     ]
+
+        # off=[(0, 0)]
+        # for i in range(len(wn)-1):
+        #     v=(dim[0][0]+margin, 0), (dim[0][0]+dim[1][0]+2*margin, 0)]
+        #     off.append(v)
+            
+        # for i, w in enumerate(wn):
+        #     cv2.namedWindow(w, cv2.WINDOW_NORMAL)
+        #     cv2.resizeWindow(w, dim[i][0], dim[i][1])
+
+        # cv2.moveWindow(w, off[i][0], off[i][1])
 
 
     def __learn(self, q):
         learner=LearnModel(self.max_learn_frames)
-        self.imagemodel, self.alpha=learner.learn(q, q_window_name=None)
+        self.imagemodel=learner.learn(q, q_window_name=Config.video_src)
 
 
     def __determine_action(self, frame, roi_frame, detect_result):
-        self.imagemodel=self.statemanager.update_state(frame, roi_frame, self.imagemodel, self.alpha, detect_result)
+        self.imagemodel=self.statemanager.update_state(frame, roi_frame, self.imagemodel, detect_result)
 
 
     def run(self):
 
         # create capture thread
         self.capture_thread=CaptureThread(name='CaptureThread', 
-            args=(self.q, self.vid_src, self.stop_event, self.capture_started_event))
+            args=(self.q, self.stop_event, self.capture_started_event))
         self.capture_thread.start()
 
         print('Waiting for capture starting')
         self.capture_started_event.wait()
 
-        self.__create_image_window()
+        create_image_window()
 
         # build model if necessary
         if self.imagemodel == None:
@@ -287,10 +368,11 @@ class MainController():
                 cur_frame_ir=vframe.check_ir()
 
                 # plt.subplot(1, 3, 1)
-                cv2.imshow(self.vid_src, frame)
+                # cv2.imshow(Config.video_src, frame)
                 # plt.show()
 
-                if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+                # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+                if not show_frame(frame):
                     print('Stopping capture')
                     self.stop_event.set()
                     continue
@@ -317,13 +399,16 @@ class MainController():
             detector=ObjectDetector(self.imagemodel, frame)
             detect_result, roi_frame=detector.detect(draw_frame=vframe)
 
-            # plt.subplot(1, 3, 3)
-            cv2.imshow("Detector", frame)
-            cv2.imshow('Model', self.imagemodel.astype('uint8'))
-            # plt.show()
-            if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+            if not show_frame(detect=vframe.frame, model=self.imagemodel.pixel.astype('uint8')):
                 self.stop_event.set()
                 break
+            # plt.subplot(1, 3, 3)
+            # cv2.imshow("Detector", frame)
+            # cv2.imshow('Model', self.imagemodel.pixel.astype('uint8'))
+            # # plt.show()
+            # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+            #     self.stop_event.set()
+            #     break
             self.__determine_action(frame, roi_frame, detect_result)
 
 
@@ -347,6 +432,7 @@ class SegmentObject():
     @staticmethod
     def get_gray_image(frame):
         frame_gray=cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # frame_gray=cv2.equalizeHist(frame_gray, 256)
         frame_gray=cv2.GaussianBlur(frame_gray, (5, 5), 0)
 
         return frame_gray
@@ -357,19 +443,22 @@ class SegmentObject():
         # cv2.putText(frame, "sequence: ", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, 255)
         roi_frame0=get_roi_frame(frame)
         roi_frame=SegmentObject.get_gray_image(roi_frame0)
-        difference=cv2.absdiff(self.imagemodel.astype('uint8'), roi_frame)
+        difference=cv2.absdiff(self.imagemodel.pixel.astype('uint8'), roi_frame)
         # print(f'sum(difference): {np.sum(difference)}')
         # cv2.imshow('difference:absdiff', difference)
 
         # _, difference=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        _, difference=cv2.threshold(difference, 35, 245, cv2.THRESH_BINARY)
+        _, difference=cv2.threshold(difference, 35, 255, cv2.THRESH_BINARY)
         # cv2.imshow('difference:threshold', difference)
 
         # difference=cv2.adaptiveThreshold(difference, 245, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 0)
 
-        kernel = np.ones((9,9),np.uint8)
+        kernel = np.ones((7,7),np.uint8)
         difference=cv2.dilate(difference, kernel)
-        # cv2.imshow('difference:dialate', difference)
+        kernel = np.ones((5,5),np.uint8)
+        difference=cv2.erode(difference, kernel)
+        
+        show_frame(difference=cv2.imshow('Difference', difference))
 
         lbound=200
         ubound=255
@@ -381,8 +470,25 @@ class SegmentObject():
     # constraint_function: lambda x : x + (roix, roiy)
     def __find_contours(self, mask, constraint_function):
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+        # side effect occurs
+        # --------------------
+        # for i, con in enumerate(contours):
+        #     wlen=9
+        #     T=1./wlen
+        #     w=np.ones(wlen)
+        #     con2=con
+        #     if len(con) > 9:
+        #         x0=con2[:, 0, 0]
+        #         con2[:, 0, 0]=np.convolve(w/w.sum(), x0, mode='same')
+        #         y0=con2[:, 0, 1]
+        #         con2[:, 0, 1]=np.convolve(w/w.sum(), y0, mode='same')
+        #         contours[i] = con2
+
+        # cv2.blur(contours, )
         contours=sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
         contours=list(map(constraint_function, contours))
 
         convexhull=[]
@@ -400,17 +506,41 @@ class ObjectDetector(SegmentObject):
 
     # draw_frame : VideoFrame
     def detect(self, draw_frame=None):
+        detected=0
+        classifier={}
+
+        # blob
         roi_frame, difference, mask=self.segment()
         ious, sumiou, maxiou=self.__find_iou(self.contours)
 
-        if maxiou > Config.MAX_IOU and maxiou < 0.5:
-            print(f'\r{maxiou:.2f}')
+        local_feature=np.array(ious[:3])
+        instance_feature=self.__extract_feature(roi_frame)
+        feature_score=self.__match_sequence(self.imagemodel.feature, instance_feature)
+
+        classifier['maxiou']=maxiou > Config.MAX_IOU
+        classifier['sumiou']=sumiou < 0.3
+        # classifier['feature_score']=feature_score < 100
+        classifier['feature_score']=True
+
+        print(f'maxiou: {maxiou:.2f}:{classifier["maxiou"]}  '+
+            f'sumiou: {sumiou:.2f}:{classifier["sumiou"]}  '+
+            f'feature_score: {feature_score:.2f}:{classifier["feature_score"]}')
+
+        if len(list(filter(lambda x : x == True, classifier.values()))) == len(classifier):
+            detected=1
             if draw_frame:
                 self.__draw(draw_frame, ious)
 
-            return (1, roi_frame)
+        return (detected, roi_frame)
 
-        return (0, roi_frame)
+
+    def __match_sequence(self, x, y):
+        sse=((x - y) ** 2).mean(axis=None)
+        return sse
+
+    def __extract_feature(self, frame):
+        feature=ImageModel.extract_feature(frame)
+        return feature
 
     def __find_iou(self, contours):
         iou=[]
@@ -420,8 +550,28 @@ class ObjectDetector(SegmentObject):
             # if not cv2.isContourConvex(con):
             #     continue
             # print(f'Area{i}: {cv2.contourArea(con)}')
-            x,y,w,h = cv2.boundingRect(con)
-            v=self.__bb_intersection_over_union([x, y, x+w, y+h], self.roi)+0.001
+
+            # METHOD1 bounding box
+            # x,y,w,h = cv2.boundingRect(con)
+            # v=self.__bb_intersection_over_union([x, y, x+w, y+h], self.roi)+0.001
+
+            # METHOD2 contour area
+            #  1. smoothing
+            #  2. find area
+            wlen=9
+            T=1./wlen
+            w=np.ones(wlen)
+            # x
+
+            con2=con
+            # if len(con) > 9:
+            #     x0=con2[:, 0, 0]
+            #     con2[:, 0, 0]=np.convolve(w/w.sum(), x0, mode='same')
+            #     y0=con2[:, 0, 1]
+            #     con2[:, 0, 1]=np.convolve(w/w.sum(), y0, mode='same')
+
+            v=float(cv2.contourArea(con2))/area(Config.ROI)
+
             sumiou+=v
             maxiou=max(v, maxiou)
             iou.append(v)
@@ -475,14 +625,13 @@ class CaptureThread(threading.Thread):
         self.target=target
         self.name=name
         self.q=args[0]
-        self.vid_src=args[1]
-        self.stop_event=args[2]
-        self.capture_started_event=args[3]
+        self.stop_event=args[1]
+        self.capture_started_event=args[2]
 
 
     def run(self):
         print('connecting to device ...')
-        vcap_act = cv2.VideoCapture(self.vid_src)
+        vcap_act = cv2.VideoCapture(Config.video_src)
         print('connected ...')
 
         Config.VIDEO_WIDTH=int(vcap_act.get(3))
@@ -497,7 +646,7 @@ class CaptureThread(threading.Thread):
             ret, frame = vcap_act.read()
             if not(ret):
                 vcap_act.release()
-                vcap_act = cv2.VideoCapture(self.vid_src)
+                vcap_act = cv2.VideoCapture(Config.video_src)
                 continue
 
             if frame is None:
@@ -581,17 +730,17 @@ class LearnModel():
 
     def learn_from_file(self, filepath):
         # filepath: 
-        vid_src=filepath
+        Config.video_src=filepath
         if not os.path.exists(filepath):
             return None
 
         event=threading.Event()
         event.clear()
         q=Queue()
-        th=CaptureThread(name="CaptureThread", args=(q, vid_src, event))
+        th=CaptureThread(name="CaptureThread", args=(q, event))
         th.start()
 
-        ret=self.learn(q, q_window_name=None)
+        ret=self.learn(q, q_window_name=filepath)
         event.set()
         th.join(5000)
         print(f'Waiting for {th.name} terminate...')
@@ -607,28 +756,31 @@ class LearnModel():
         is_first=True
         maxlen=50
         dq=deque([], maxlen)
+        
+        w=Config.VIDEO_WIDTH
+        h=Config.VIDEO_HEIGHT
+
+        nsamples=100
+        widx=np.random.randint(w, size=nsamples)
+        hidx=np.random.randint(h, size=nsamples)
+
         # nskip=1
         while True:
             try:
                 vframe=q.popleft()
                 frame=vframe.frame
+                if q_window_name:
+                    show_frame(detect=frame)
             except IndexError:
-                time.sleep(0.1)
+                # time.sleep(0.01)
                 continue
-
-            if q_window_name:
-                # plt.subplot(1, 3, 1)
-                cv2.imshow(q_window_name, frame)
-                # plt.show()
-                if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
-                    break
 
             if is_first:
                 prev_frame=frame
                 is_first=False
                 continue
             # if nskip % 5 == 0:
-            dq.append(((frame - prev_frame) ** 2).mean(axis=None))
+            dq.append(((frame[hidx[:nsamples], widx[:nsamples], :] - prev_frame[hidx[:nsamples], widx[:nsamples], :]) ** 2).mean(axis=None))
             prev_frame=frame
             # print('fetch frame')
             if len(dq) == maxlen:
@@ -641,6 +793,8 @@ class LearnModel():
 
     def learn(self, q, q_window_name=None, wait_until_stable=True):
 
+        imagemodel=ImageModel()
+
         if wait_until_stable:
             print('Waiting for scene stable')
             self.wait_for_stable(q, q_window_name)
@@ -648,7 +802,6 @@ class LearnModel():
         print('learning ... ', end='')
         ref_count=0
         alpha=0
-        model_frame=None
         while ref_count < self.n:
             try:
                 vframe=q.popleft()
@@ -662,27 +815,41 @@ class LearnModel():
             ref_count+=1
             # print(f'ref_count={ref_count}/{self.n}')
             if ref_count == 1:
-                model_frame=frame_gray
+                imagemodel.pixel=frame_gray
+                imagemodel.feature=ImageModel.extract_feature(frame_gray)
                 continue
-            
-            alpha=1./ref_count
-            model_frame=LearnModel.update_model(model_frame, frame_gray, alpha)
+
+            imageinstance=ImageModel(frame_gray, None)
+
+            imagemodel.alpha=1./ref_count
+            imagemodel=LearnModel.update_model(imagemodel, imageinstance)
+            # imagemodel.pixel=LearnModel.update_mean(imagemodel.pixel, imageinstance.pixel, alpha)
+            # imagemodel.hist=LearnModel.update_mean(imagemodel.hist, imageinstance.hist, alpha)
             if q_window_name:
-                # plt.subplot(1, 3, 1)
-                cv2.imshow(q_window_name, frame)
-                # plt.subplot(1, 3, 2)
-                cv2.imshow('Model', model_frame.astype('uint8'))
-                # plt.show()
-                if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+                if not show_frame(frame, frame, imagemodel.pixel.astype('uint8'), None):
                     break
+                # # plt.subplot(1, 3, 1)
+                # cv2.imshow(q_window_name, frame)
+                # # plt.subplot(1, 3, 2)
+                # cv2.imshow('Model', imagemodel.pixel.astype('uint8'))
+                # # plt.show()
+                # cv2.imshow('Detector', frame)
+                # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+                #     break
 
         print('done')
 
-        return model_frame, alpha
+        return imagemodel
 
 
     @staticmethod
-    def update_model(imagemodel, new_frame, alpha):
+    def update_model(imagemodel, instanceimage):
+        imagemodel.pixel=LearnModel.update_mean(imagemodel.pixel, instanceimage.pixel, imagemodel.alpha)
+        imagemodel.hist=LearnModel.update_mean(imagemodel.feature, instanceimage.feature, imagemodel.alpha)
+        return imagemodel
+
+    @staticmethod
+    def update_mean(imagemodel, new_frame, alpha):
         return alpha*new_frame+(1-alpha)*imagemodel
 
 # def monitor(context, update):
@@ -711,7 +878,7 @@ def send_video(v):
         timeout=120)
 
 
-def main():
+def main(argv):
 
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                      level=logging.INFO)
@@ -719,6 +886,7 @@ def main():
     # addr='act4.avi'
     with open('address.txt') as fd:
         addr=fd.readline().strip()
+    Config.video_src=addr
 
     # model from file
     # ref='ref1.mp4'
@@ -726,7 +894,7 @@ def main():
     # model=learner.learn_from_file(ref)
 
     # model from live stream
-    imagemodel=None
+    Config.imagemodel=None
 
     if os.path.exists('config.json'):
         with open('config.json') as fd:
@@ -741,7 +909,7 @@ def main():
             js=fd.read()
             Config.statemodel=HiddenMarkovModel.from_json(js)
 
-    controller=MainController(addr, Config.statemodel, imagemodel)
+    controller=MainController(Config.statemodel, Config.imagemodel)
 
     controller.run()
 
@@ -749,7 +917,7 @@ def main():
 if __name__ == '__main__':
 
 
-    main()
+    main(sys.argv)
 
     # updater = Updater(token=config.TG_TOKEN, use_context=True)
     # dispatcher = updater.dispatcher

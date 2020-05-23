@@ -24,21 +24,22 @@ from pomegranate import *
 
 class Config():
 
-    FPS=20
+    FPS=10
     WRITE_FPS=10
     # 20 frames/sec * 30sec
-    MAX_CAPTURE_BUFFER=FPS*30
-    MAX_TIMELINE=2*FPS
-    MAX_LEARN_FRAMES=FPS*2
-    ROI=[444, 0, 1055, 690]
-    MAX_NHISTORY=FPS*60 # 1 minute
+    MAX_CAPTURE_BUFFER=FPS*60
+    MAX_TIMELINE=5*FPS
+    MAX_LEARN_FRAMES=FPS*3
+    MAX_NHISTORY=FPS*5
+     # 1 minute
+    ROI=[444, 0, 1055, 720]
     VIDEO_WIDTH=-1
     VIDEO_HEIGHT=-1
     MAX_COLOR_SAMPLES=100
     WAITKEY_MS=50
     TG_CHAT_ID=None
     TG_TOKEN=None
-    MAX_IOU=0.1
+    MAX_IOU=0.08
     send_video=False
     statemodel=None
 
@@ -46,7 +47,7 @@ class Config():
     tg_bot=None
 
 
-class State(Enum):
+class State():
     UNKNOWN=0
     ABSENT=1
     ENTERED=2
@@ -110,9 +111,9 @@ class VideoFile():
 
 
 class VideoFrame():
-    def __init__(self, frame, state=State.UNKNOWN):
+    def __init__(self, frame, objstate=State.ABSENT):
         self.frame=frame
-        self.state=state
+        self.objstate=objstate
         self.msec=0
         self.iframes=0
         self.is_ir=None
@@ -135,10 +136,12 @@ class StateManager():
         self.statemodel=statemodel
 
     def clear(self):
+        self.cur_state=State.UNKNOWN
+        self.prev_state=State.UNKNOWN
         self.framebuf=[]
         self.threadlist=[]
         self.nhistorystack=[]
-        self.pool_sema = BoundedSemaphore(value=3)
+        self.pool_sema = BoundedSemaphore(value=1)
 
     def stop_writing_thread(self):
         exitthreadcount=0
@@ -155,41 +158,45 @@ class StateManager():
                     print(f'thread : {t.name} is alive')
 
 
-    def update_state(self, frame, roi_frame, imagemodel, alpha, detect_result):
-        if len(self.framebuf) < max_nhistory:
-            self.framebuf.append(VideoFrame(frame, State.UNKNOWN))
-            imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
-            return imagemodel
+    def update_state(self, frame, roi_frame, imagemodel, alpha, new_state):
+        # if len(self.framebuf) < self.nhistory:
+        #     self.framebuf.append(VideoFrame(frame, new_state))
+        #     # imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
+        #     return imagemodel
 
         while len(self.framebuf) > self.nhistory:
             self.framebuf.pop(0)
 
-        cur_state=detect_result
-        prev_state=self.framebuf[-1].state
+        self.framebuf.append(VideoFrame(frame, new_state))
 
-        # self.state_history+=self.statedict[cur_state]
-        # if len(self.state_history) == 100:
-        # with open('hmmtest-act3.txt', 'w+') as fd:
-        #     fd.write(self.state_history)
-        # with open('hmmtest-act3.txt', 'a+') as fd:
-        #     fd.write('1' if detect_result else '0')
+        # seq=np.array([ str(frame.objstate) for frame in self.framebuf ])
+        # pseq=np.array(self.statemodel.predict(seq))
+
+        seq=np.array([ float(frame.objstate) for frame in self.framebuf ])
+        wlen=3
+        T=1./wlen
+        w=np.ones(wlen)
+        pseq=np.convolve(w/w.sum(), seq, mode='same')
+
+        self.cur_state=pseq[-1]
+        self.prev_state=pseq[-wlen]
+
+        # np.set_printoptions(precision=2)
+        # print(''.join(list(map(lambda x : 'T' if x > T else '.', pseq.tolist()))))
 
         # ABSENT -> ABSENT
-        if cur_state==State.ABSENT or prev_state==State.ABSENT:
+        if self.prev_state < T and self.cur_state < T:
             imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
-            next_state = State.ENTERED if detect_result else State.ABSENT
         # ABSENT -> PRESENT
-        elif cur_state==State.ENTERED:
-            next_state = State.PRESENT if detect_result else State.ABSENT
-            self.nhistorystack.insert(0, self.nhistory)
+        elif self.prev_state < T and self.cur_state >= T:
+            self.nhistory+=1
         # PRESENT -> PRESENT
-        elif cur_state==State.PRESENT:
-            next_state = State.PRESENT if detect_result else State.LEFT
-            self.nhistory=max(self.nhistory+1, self.max_nhistory)
+        elif self.prev_state >= T and self.cur_state >= T:
+            self.nhistory+=1
         # PRESENT -> ABSENT
-        elif cur_state==State.LEFT:
-            next_state = State.ENTERED if detect_result else State.ABSENT
-            self.nhistory=self.nhistorystack.pop(0)
+        elif self.prev_state >= T and self.cur_state < T:
+            if len(self.framebuf) > 50:
+
             q=Queue(len(self.framebuf))
             for item in self.framebuf:
                 q.put(copy.copy(item))
@@ -197,8 +204,9 @@ class StateManager():
                 args=(q, frame.shape[1], frame.shape[2], 'Object detected', self.pool_sema))
             self.threadlist.append(th)
             th.start()
-
-        self.framebuf.append(VideoFrame(frame, next_state))
+            
+            self.nhistory=self.max_nhistory
+            self.framebuf=[]
 
         return imagemodel
 
@@ -217,20 +225,25 @@ class MainController():
         self.imagemodel=imagemodel
         self.alpha=1
         self.statemanager=StateManager(statemodel, self.max_timeline)
-        self.prev_frame_ir=False
+        self.prev_frame_ir=None
+
 
     def __create_image_window(self):
-        nw, nh=(int(Config.VIDEO_WIDTH*0.5), int(Config.VIDEO_HEIGHT*0.5))
-        wn=[self.vid_src, 'Model', 'Detector']
-        off=[(0, 0), (1, 0), (2, 0)]
+        scale=0.4
+        margin=20
+        nw, nh=(int(Config.VIDEO_WIDTH*scale), int(Config.VIDEO_HEIGHT*scale))
+        wn=[self.vid_src, 'Detector', 'Model']
+        dim=[(nw, nh), (nw, nh), (int((Config.ROI[2]-Config.ROI[0])*scale), int((Config.ROI[3]-Config.ROI[1])*scale))]
+        off=[(0, 0), (dim[0][0]+margin, 0), (dim[0][0]+dim[1][0]+2*margin, 0)]
         for i, w in enumerate(wn):
             cv2.namedWindow(w, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(w, nw, nh)
-            cv2.moveWindow(w, off[i][0]*nw, off[i][1]*nh)
+            cv2.resizeWindow(w, dim[i][0], dim[i][1])
+            cv2.moveWindow(w, off[i][0], off[i][1])
+
 
     def __learn(self, q):
         learner=LearnModel(self.max_learn_frames)
-        self.model, self.alpha=learner.learn(q, q_window_name=None)
+        self.imagemodel, self.alpha=learner.learn(q, q_window_name=None)
 
 
     def __determine_action(self, frame, roi_frame, detect_result):
@@ -247,14 +260,17 @@ class MainController():
         print('Waiting for capture starting')
         self.capture_started_event.wait()
 
-        # self.__create_image_window()
+        self.__create_image_window()
 
         # build model if necessary
-        if self.model == None:
+        if self.imagemodel == None:
             print('Building model ...')
             self.__learn(self.q)
 
         # fetch frame
+        prev_frame=None
+        frame=None
+
         while True:
 
             # check if capture thread is running
@@ -264,20 +280,23 @@ class MainController():
 
             try:
                 vframe=self.q.popleft()
+
+                prev_frame=frame
                 frame=vframe.frame
+
                 cur_frame_ir=vframe.check_ir()
 
                 # plt.subplot(1, 3, 1)
-                # cv2.imshow(self.vid_src, frame)
+                cv2.imshow(self.vid_src, frame)
                 # plt.show()
 
-                # if cv2.waitKey(Const.WAITKEY_MS)==ord('q'):
-                #     print('Stopping capture')
-                #     self.stop_event.set()
-                #     continue
+                if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
+                    print('Stopping capture')
+                    self.stop_event.set()
+                    continue
                 # print(f'ir: {cur_frame_ir}')
             except IndexError:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
             # check if CCD switched to IR or vice versa
@@ -288,20 +307,24 @@ class MainController():
             #    if light condition is changed, rebuild model
             if self.prev_frame_ir != None and self.prev_frame_ir != cur_frame_ir:
                 print('Video color changed')
+                # cv2.imwrite('p.jpg', prev_frame)
+                # cv2.imwrite('c.jpg', frame)
                 self.__learn(self.q)
+
             self.prev_frame_ir=cur_frame_ir
 
             # detect object
             detector=ObjectDetector(self.imagemodel, frame)
-            detect_result=detector.detect(draw_frame=vframe)
+            detect_result, roi_frame=detector.detect(draw_frame=vframe)
 
             # plt.subplot(1, 3, 3)
             cv2.imshow("Detector", frame)
+            cv2.imshow('Model', self.imagemodel.astype('uint8'))
             # plt.show()
             if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
                 self.stop_event.set()
                 break
-            self.__determine_action(frame, detector.model, detect_result)
+            self.__determine_action(frame, roi_frame, detect_result)
 
 
     def is_color_changed(self, frame):
@@ -309,15 +332,17 @@ class MainController():
 
 
 class SegmentObject():
-    def __init__(self, model, frame):
-        self.model=model
+    def __init__(self, imagemodel, frame):
+        self.imagemodel=imagemodel
         self.frame=frame
         self.roi=Config.ROI
+        self.convexhulls=None
+        self.contours=None
 
     def segment(self):
-        frame_gray, difference, mask=self.__process_image(self.frame)
-        self.contours=self.__find_contours(mask, lambda x : x + (self.roi[0], self.roi[1]))
-        return frame_gray, difference, mask
+        roi_frame, difference, mask=self.__process_image(self.frame)
+        self.contours, self.convexhulls=self.__find_contours(mask, lambda x : x + (self.roi[0], self.roi[1]))
+        return roi_frame, difference, mask
 
     @staticmethod
     def get_gray_image(frame):
@@ -330,9 +355,9 @@ class SegmentObject():
     def __process_image(self, frame):
 
         # cv2.putText(frame, "sequence: ", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, 255)
-        roi_frame=get_roi_frame(frame)
-        frame_gray=SegmentObject.get_gray_image(roi_frame)
-        difference=cv2.absdiff(self.model.astype('uint8'), frame_gray)
+        roi_frame0=get_roi_frame(frame)
+        roi_frame=SegmentObject.get_gray_image(roi_frame0)
+        difference=cv2.absdiff(self.imagemodel.astype('uint8'), roi_frame)
         # print(f'sum(difference): {np.sum(difference)}')
         # cv2.imshow('difference:absdiff', difference)
 
@@ -350,7 +375,7 @@ class SegmentObject():
         ubound=255
         mask=cv2.inRange(difference, lbound, ubound)
 
-        return frame_gray, difference, mask
+        return roi_frame, difference, mask
 
 
     # constraint_function: lambda x : x + (roix, roiy)
@@ -360,33 +385,40 @@ class SegmentObject():
         contours=sorted(contours, key=cv2.contourArea, reverse=True)[:5]
         contours=list(map(constraint_function, contours))
 
-        return contours
+        convexhull=[]
+        # for ct in contours:
+        #     ch=cv2.convexHull(ct, False)
+        #     convexhull.append(ch)
+
+        return contours, convexhull
 
 
 class ObjectDetector(SegmentObject):
-    def __init__(self, model, frame):
-        super(ObjectDetector, self).__init__(model, frame)
-        self.contours=None
+    def __init__(self, imagemodel, frame):
+        super(ObjectDetector, self).__init__(imagemodel, frame)
 
 
     # draw_frame : VideoFrame
     def detect(self, draw_frame=None):
-        self.model, difference, mask=self.segment()
+        roi_frame, difference, mask=self.segment()
         ious, sumiou, maxiou=self.__find_iou(self.contours)
 
-        if draw_frame:
-            self.__draw(draw_frame, ious)
+        if maxiou > Config.MAX_IOU and maxiou < 0.5:
+            print(f'\r{maxiou:.2f}')
+            if draw_frame:
+                self.__draw(draw_frame, ious)
 
-        if maxiou > Config.MAX_IOU:
-            return True
+            return (1, roi_frame)
 
-        return False
+        return (0, roi_frame)
 
     def __find_iou(self, contours):
         iou=[]
         maxiou=-1
         sumiou=0
         for i, con in enumerate(contours):
+            # if not cv2.isContourConvex(con):
+            #     continue
             # print(f'Area{i}: {cv2.contourArea(con)}')
             x,y,w,h = cv2.boundingRect(con)
             v=self.__bb_intersection_over_union([x, y, x+w, y+h], self.roi)+0.001
@@ -410,7 +442,7 @@ class ObjectDetector(SegmentObject):
             clr=(255-i*(255/len(self.contours)), 0, 0)
             cv2.rectangle(frame, (x0, y0), (x1, y1), clr, -1)
             cv2.putText(frame, f"{iou:.2f}", (x0, y0-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, clr)
-        cv2.drawContours(frame, self.contours, -1, (0, 255, 0), 3)
+        cv2.drawContours(frame, self.contours, -1, (0, 255, 0), thickness=cv2.FILLED)
         cv2.rectangle(frame, (Config.ROI[0], Config.ROI[1]), (Config.ROI[2], Config.ROI[3]), (220, 220, 220), 2)
         cv2.putText(frame, f'msec: {vframe.msec/1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
         cv2.putText(frame, f'iframes: {vframe.iframes}', (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
@@ -452,10 +484,11 @@ class CaptureThread(threading.Thread):
         print('connecting to device ...')
         vcap_act = cv2.VideoCapture(self.vid_src)
         print('connected ...')
-        self.capture_started_event.set()
 
         Config.VIDEO_WIDTH=int(vcap_act.get(3))
         Config.VIDEO_HEIGHT=int(vcap_act.get(4))
+
+        self.capture_started_event.set()
 
         start_msec=datetime.datetime.now().timestamp()
 
@@ -476,12 +509,12 @@ class CaptureThread(threading.Thread):
             #     continue
 
             # if len(self.q)==self.q.maxlen:
-                # print('Capture queue is full. dropping previous frame')
+            #     print('Capture queue is full. dropping previous frame')
                 # self.q.get()
                 # time.sleep(0.1)
 
-            s=datetime.datetime.now().isoformat()
-            cv2.putText(frame, f"{s}", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
+            # s=datetime.datetime.now().isoformat()
+            # cv2.putText(frame, f"{s}", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
             vframe=VideoFrame(frame)
 
             vframe.iframes=vcap_act.get(cv2.CAP_PROP_POS_FRAMES)
@@ -509,7 +542,7 @@ class WriteThread(threading.Thread):
         self.sema=args[4]
 
     def run(self):
-        print(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
+        # print(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
         s=datetime.datetime.now().replace(microsecond=0).isoformat()
         s=re.sub('[-:]', '', s)
         fn='detected/'+s+".mp4"    
@@ -533,7 +566,7 @@ class WriteThread(threading.Thread):
 
             vcap_out.release()
             # write_event.clear()
-            print(f'{threading.get_ident()} write_framebuf finished')
+            # print(f'{threading.get_ident()} write_framebuf finished')
 
             # vf=VideoFile(fn, end_msec)            
             # Config.tg_video_q.put_nowait(fn)
@@ -574,7 +607,7 @@ class LearnModel():
         is_first=True
         maxlen=50
         dq=deque([], maxlen)
-        nskip=1
+        # nskip=1
         while True:
             try:
                 vframe=q.popleft()
@@ -594,16 +627,16 @@ class LearnModel():
                 prev_frame=frame
                 is_first=False
                 continue
-            if nskip % 5 == 0:
-                dq.append(((frame - prev_frame) ** 2).mean(axis=None))
-                prev_frame=frame
-                # print('fetch frame')
+            # if nskip % 5 == 0:
+            dq.append(((frame - prev_frame) ** 2).mean(axis=None))
+            prev_frame=frame
+            # print('fetch frame')
             if len(dq) == maxlen:
                 v=np.var(dq)
                 print(f'wait_for_stable : {v}')
                 if v < 40.0:
                     return
-            nskip+=1
+            # nskip+=1
 
 
     def learn(self, q, q_window_name=None, wait_until_stable=True):
@@ -649,8 +682,8 @@ class LearnModel():
 
 
     @staticmethod
-    def update_model(model_frame, new_frame, alpha):
-        return alpha*new_frame+(1-alpha)*model_frame
+    def update_model(imagemodel, new_frame, alpha):
+        return alpha*new_frame+(1-alpha)*imagemodel
 
 # def monitor(context, update):
 #     fn=''
@@ -683,9 +716,9 @@ def main():
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                      level=logging.INFO)
 
-    addr='act2.avi'
-    # with open('address.txt') as fd:
-    #     addr=fd.readline().strip()
+    # addr='act4.avi'
+    with open('address.txt') as fd:
+        addr=fd.readline().strip()
 
     # model from file
     # ref='ref1.mp4'
@@ -703,8 +736,9 @@ def main():
             Config.tg_bot=Bot(Config.TG_TOKEN)
 
     if os.path.exists('hmm.json'):
-        with open('hmm.json') as fd:
-            js=json.load(fd)
+        with open('hmm.json', 'rt') as fd:
+            # js=json.load(fd)
+            js=fd.read()
             Config.statemodel=HiddenMarkovModel.from_json(js)
 
     controller=MainController(addr, Config.statemodel, imagemodel)

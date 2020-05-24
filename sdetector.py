@@ -24,6 +24,8 @@ import json
 from pomegranate import *
 import sys
 import random
+import logging
+from scipy.ndimage import interpolation
 
 
 class Config():
@@ -108,25 +110,32 @@ def show_frame(org=None, detect=None, model=None, difference=None, waitKey=True)
 
 def create_image_window():
     scale=0.4
-    margin=50
+    wm, hm=(5, 35)
     nw, nh=(int(Config.VIDEO_WIDTH*scale), int(Config.VIDEO_HEIGHT*scale))
     rnw, rnh=(int(width(Config.ROI)*scale), int(height(Config.ROI)*scale))
     wn=[Config.video_src, 'Detector', 'Model', 'Difference']
-    cv2.namedWindow(wn[0], cv2.WINDOW_NORMAL)
+    
+    flags=cv2.WINDOW_NORMAL|cv2.WINDOW_GUI_EXPANDED|cv2.WINDOW_KEEPRATIO
+
+    cv2.namedWindow(wn[0], flags)
     cv2.moveWindow(wn[0], 0, 0)
     cv2.resizeWindow(wn[0], nw, nh)
 
-    cv2.namedWindow(wn[1], cv2.WINDOW_NORMAL)
-    cv2.moveWindow(wn[1], nw+margin, 0)
+    cv2.namedWindow(wn[1], flags)
+    cv2.moveWindow(wn[1], 0, nh+hm)
     cv2.resizeWindow(wn[1], nw, nh)
 
-    cv2.namedWindow(wn[2], cv2.WINDOW_NORMAL)
-    cv2.moveWindow(wn[2], 0, nh+margin)
+    cv2.namedWindow(wn[2], flags)
+    cv2.moveWindow(wn[2], nw+wm, 0)
     cv2.resizeWindow(wn[2], rnw, rnh)
 
-    cv2.namedWindow(wn[3], cv2.WINDOW_NORMAL)
-    cv2.moveWindow(wn[3], rnw+margin, rnh+margin)
+    cv2.namedWindow(wn[3], flags)
+    cv2.moveWindow(wn[3], nw+wm, nh+hm)
     cv2.resizeWindow(wn[3], rnw, rnh)
+
+    # now supported
+    # cv2.displayStatusBar(wn[0], datetime.datetime.now().isoformat())
+
 
 class VideoFileMerger():
     def __init__(self, q):
@@ -220,6 +229,8 @@ class StateManager():
         self.threadlist=[]
         self.nhistorystack=[]
         self.pool_sema = BoundedSemaphore(value=1)
+        self.last_writing_time=datetime.datetime.today().replace(hour=0, minute=0, second=0)
+
 
     def stop_writing_thread(self):
         exitthreadcount=0
@@ -227,40 +238,57 @@ class StateManager():
             t.join(Config.FPS)
             if not t.is_alive():
                 exitthreadcount+=1
-                print(f'thread exited : {t.name} {i}/{len(self.threadlist)}')
+                logging.info(f'thread exited : {t.name} {i}/{len(self.threadlist)}')
 
         if exitthreadcount != len(self.threadlist):
             for i, t in enumerate(self.threadlist):
                 t.join(Config.FPS)
                 if t.is_alive():
-                    print(f'thread : {t.name} is alive')
+                    logging.info(f'thread : {t.name} is alive')
 
 
-    def update_state(self, frame, roi_frame, imagemodel, new_state):
+    def update_state(self, frame, roi_frame, imagemodel, new_state, color_changed):
         # if len(self.framebuf) < self.nhistory:
         #     self.framebuf.append(VideoFrame(frame, new_state))
         #     # imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
         #     return imagemodel
+
+        # if color is changed, write previous frame
+        if color_changed and self.__determine_writing():
+            self.__write_frames(frame.shape[1], frame.shape[2], self.framebuf)
+            self.nhistory=self.max_nhistory
+            self.framebuf=[]
 
         while len(self.framebuf) > self.nhistory:
             self.framebuf.pop(0)
 
         self.framebuf.append(VideoFrame(frame, new_state))
 
+        nframebuf=len(self.framebuf)
+        self.cur_state=new_state
+
         # seq=np.array([ str(frame.objstate) for frame in self.framebuf ])
         # pseq=np.array(self.statemodel.predict(seq))
 
         seq=np.array([ float(frame.objstate) for frame in self.framebuf ])
-        wlen=3
+        wlen=min(7, nframebuf)
         T=1./wlen
         w=np.ones(wlen)
         pseq=np.convolve(w/w.sum(), seq, mode='same')
+        
+        output_disp_size=40
+        z=output_disp_size/len(pseq)
+        pseqs=interpolation.zoom(pseq, z)
+        logging.info(f"pseq={''.join(map(lambda x : '1' if x > T else '0', pseqs))}")
 
-        self.cur_state=pseq[-1]
-        self.prev_state=pseq[-wlen]
+        if wlen > 1:
+            self.cur_state=pseq[-1]
+            self.prev_state=pseq[-wlen]
+        else:
+            self.prev_state=self.cur_state
 
         # np.set_printoptions(precision=2)
-        # print(''.join(list(map(lambda x : 'T' if x > T else '.', pseq.tolist()))))
+        # logging.info(''.join(list(map(lambda x : 'T' if x > T else '.', pseq.tolist()))))
 
         # ABSENT -> ABSENT
         if self.prev_state < T and self.cur_state < T:
@@ -274,20 +302,54 @@ class StateManager():
             self.nhistory+=1
         # PRESENT -> ABSENT
         elif self.prev_state >= T and self.cur_state < T:
-            # if len(self.framebuf) > 50:
-
-            q=Queue(len(self.framebuf))
-            for item in self.framebuf:
-                q.put(copy.copy(item))
-            th=WriteThread(name=f'WriteThread{len(self.threadlist)}', 
-                args=(q, frame.shape[1], frame.shape[2], 'Object detected', self.pool_sema))
-            self.threadlist.append(th)
-            th.start()
-            
+            if self.__determine_writing():
+                self.__write_frames(frame.shape[1], frame.shape[2], self.framebuf)
             self.nhistory=self.max_nhistory
             self.framebuf=[]
 
         return imagemodel
+
+
+    def __write_frames(self, w, h, framebuf):
+        q=Queue(len(framebuf))
+        for item in framebuf:
+            q.put(copy.copy(item))
+        th=WriteThread(name=f'WriteThread{len(self.threadlist)}', 
+            # args=(q, frame.shape[1], frame.shape[2], 'Object detected', self.pool_sema))
+            args=(q, w, h, 'Object detected', self.pool_sema))
+
+        self.threadlist.append(th)
+        th.start()        
+    
+
+    def __determine_writing(self):
+
+        do_write=False
+
+        # 2 sec
+        T1=Config.FPS * 2
+
+        # framebuf size < T
+        nframebuf=len(self.framebuf)
+        if nframebuf < T1:
+            logging.info(f'nframebuf={nframebuf}/{T1}')
+            return False
+
+        # # object in framebuf lasts < T/2 
+        # states=[ f.objstate > 0 for f in self.framebuf ]
+
+        # Last written time < T 
+        now=datetime.datetime.now()
+        d=now-self.last_writing_time
+        self.last_writing_time=now
+        T2=5
+        if d.seconds < 5:
+            logging.info(f'last written time={nframebuf}/{T2}')
+            return False
+
+        logging.info(f'Writing file')
+        return True  
+
 
 class MainController():
 
@@ -329,8 +391,8 @@ class MainController():
         self.imagemodel=learner.learn(q, q_window_name=Config.video_src)
 
 
-    def __determine_action(self, frame, roi_frame, detect_result):
-        self.imagemodel=self.statemanager.update_state(frame, roi_frame, self.imagemodel, detect_result)
+    def __determine_action(self, frame, roi_frame, detect_result, color_changed):
+        self.imagemodel=self.statemanager.update_state(frame, roi_frame, self.imagemodel, detect_result, color_changed)
 
 
     def run(self):
@@ -340,14 +402,14 @@ class MainController():
             args=(self.q, self.stop_event, self.capture_started_event))
         self.capture_thread.start()
 
-        print('Waiting for capture starting')
+        logging.info('Waiting for capture starting')
         self.capture_started_event.wait()
 
         create_image_window()
 
         # build model if necessary
         if self.imagemodel == None:
-            print('Building model ...')
+            logging.info('Building model ...')
             self.__learn(self.q)
 
         # fetch frame
@@ -358,7 +420,7 @@ class MainController():
 
             # check if capture thread is running
             if not self.capture_thread.is_alive():
-                print(f'{self.capture_thread.name} is not running')
+                logging.info(f'{self.capture_thread.name} is not running')
                 break
 
             try:
@@ -367,18 +429,16 @@ class MainController():
                 prev_frame=frame
                 frame=vframe.frame
 
-                cur_frame_ir=vframe.check_ir()
-
                 # plt.subplot(1, 3, 1)
                 # cv2.imshow(Config.video_src, frame)
                 # plt.show()
 
                 # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
                 if not show_frame(frame):
-                    print('Stopping capture')
+                    logging.info('Stopping capture')
                     self.stop_event.set()
                     continue
-                # print(f'ir: {cur_frame_ir}')
+                # logging.info(f'ir: {cur_frame_ir}')
             except IndexError:
                 time.sleep(0.01)
                 continue
@@ -389,12 +449,13 @@ class MainController():
             #    IR histogram
             #    cv2.calcHist, compareHist
             #    if light condition is changed, rebuild model
-            if self.prev_frame_ir != None and self.prev_frame_ir != cur_frame_ir:
-                print('Video color changed')
+            cur_frame_ir=vframe.check_ir()
+            color_changed=self.is_color_changed(cur_frame_ir, frame)
+            if color_changed:
+                logging.info('Video color changed')
                 # cv2.imwrite('p.jpg', prev_frame)
                 # cv2.imwrite('c.jpg', frame)
                 self.__learn(self.q)
-
             self.prev_frame_ir=cur_frame_ir
 
             # detect object
@@ -411,11 +472,11 @@ class MainController():
             # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
             #     self.stop_event.set()
             #     break
-            self.__determine_action(frame, roi_frame, detect_result)
+            self.__determine_action(frame, roi_frame, detect_result, color_changed)
 
 
-    def is_color_changed(self, frame):
-        return self.prev_frame_ir != frame.is_ir
+    def is_color_changed(self, cur_frame_ir, frame):
+        return self.prev_frame_ir != None and self.prev_frame_ir != cur_frame_ir
 
 
 class SegmentObject():
@@ -446,7 +507,7 @@ class SegmentObject():
         roi_frame0=get_roi_frame(frame)
         roi_frame=SegmentObject.get_gray_image(roi_frame0)
         difference=cv2.absdiff(self.imagemodel.pixel.astype('uint8'), roi_frame)
-        # print(f'sum(difference): {np.sum(difference)}')
+        # logging.info(f'sum(difference): {np.sum(difference)}')
         # cv2.imshow('difference:absdiff', difference)
 
         # _, difference=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
@@ -504,7 +565,7 @@ class SegmentObject():
 class ObjectDetector(SegmentObject):
     def __init__(self, imagemodel, frame):
         super(ObjectDetector, self).__init__(imagemodel, frame)
-
+        
 
     # draw_frame : VideoFrame
     def detect(self, draw_frame=None):
@@ -524,9 +585,9 @@ class ObjectDetector(SegmentObject):
         # classifier['feature_score']=feature_score < 100
         classifier['feature_score']=True
 
-        print(f'maxiou: {maxiou:.2f}:{classifier["maxiou"]}  '+
-            f'sumiou: {sumiou:.2f}:{classifier["sumiou"]}  '+
-            f'feature_score: {feature_score:.2f}:{classifier["feature_score"]}')
+        # logging.info(f'maxiou: {maxiou:.2f}:{classifier["maxiou"]}  '+
+        #     f'sumiou: {sumiou:.2f}:{classifier["sumiou"]}  '+
+        #     f'feature_score: {feature_score:.2f}:{classifier["feature_score"]}')
 
         if len(list(filter(lambda x : x == True, classifier.values()))) == len(classifier):
             detected=1
@@ -546,12 +607,12 @@ class ObjectDetector(SegmentObject):
 
     def __find_iou(self, contours):
         iou=[]
-        maxiou=-1
+        maxiou=0
         sumiou=0
         for i, con in enumerate(contours):
             # if not cv2.isContourConvex(con):
             #     continue
-            # print(f'Area{i}: {cv2.contourArea(con)}')
+            # logging.info(f'Area{i}: {cv2.contourArea(con)}')
 
             # METHOD1 bounding box
             # x,y,w,h = cv2.boundingRect(con)
@@ -585,7 +646,7 @@ class ObjectDetector(SegmentObject):
         frame=vframe.frame
         maxiou=0
         padding=25
-        maxheight=1000
+        maxheight=4000
         for i, (con, iou) in enumerate(zip(self.contours, ious)):
             x0=Config.ROI[0]+(padding+50)*i
             y0=Config.ROI[3]-int(maxheight*iou)
@@ -632,9 +693,9 @@ class CaptureThread(threading.Thread):
 
 
     def run(self):
-        print('connecting to device ...')
+        logging.info('connecting to device ...')
         vcap_act = cv2.VideoCapture(Config.video_src)
-        print('connected ...')
+        logging.info('connected ...')
 
         Config.VIDEO_WIDTH=int(vcap_act.get(3))
         Config.VIDEO_HEIGHT=int(vcap_act.get(4))
@@ -660,7 +721,7 @@ class CaptureThread(threading.Thread):
             #     continue
 
             # if len(self.q)==self.q.maxlen:
-            #     print('Capture queue is full. dropping previous frame')
+            #     logging.info('Capture queue is full. dropping previous frame')
                 # self.q.get()
                 # time.sleep(0.1)
 
@@ -673,13 +734,13 @@ class CaptureThread(threading.Thread):
 
             if vframe.msec > 0:
                 fps = vframe.iframes / (vframe.msec / 1000.)
-                # print(f'fps: {fps}')
+                # logging.info(f'fps: {fps}')
             
             self.q.append(vframe)
 
         vcap_act.release()
 
-        print("capture stopped")
+        logging.info("capture stopped")
 
 
 class WriteThread(threading.Thread):
@@ -693,7 +754,7 @@ class WriteThread(threading.Thread):
         self.sema=args[4]
 
     def run(self):
-        # print(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
+        # logging.info(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
         s=datetime.datetime.now().replace(microsecond=0).isoformat()
         s=re.sub('[-:]', '', s)
         fn='detected/'+s+".mp4"    
@@ -708,7 +769,7 @@ class WriteThread(threading.Thread):
                 videoframe=self.q.get()
                 # time.sleep(10)
                 vcap_out.write(videoframe.frame)
-                # print(f'{threading.get_ident()} : {self.q.qsize()}')
+                # logging.info(f'{threading.get_ident()} : {self.q.qsize()}')
 
                 if start_msec < 0:
                     start_msec=videoframe.msec
@@ -717,7 +778,7 @@ class WriteThread(threading.Thread):
 
             vcap_out.release()
             # write_event.clear()
-            # print(f'{threading.get_ident()} write_framebuf finished')
+            # logging.info(f'{threading.get_ident()} write_framebuf finished')
 
             # vf=VideoFile(fn, end_msec)            
             # Config.tg_video_q.put_nowait(fn)
@@ -745,10 +806,10 @@ class LearnModel():
         ret=self.learn(q, q_window_name=filepath)
         event.set()
         th.join(5000)
-        print(f'Waiting for {th.name} terminate...')
+        logging.info(f'Waiting for {th.name} terminate...')
         if th.is_alive():
-            print(f"Cannot stop thread : {th.name}")
-        print(f'{th.name} terminated.')
+            logging.info(f"Cannot stop thread : {th.name}")
+        logging.info(f'{th.name} terminated.')
 
         return ret
 
@@ -756,13 +817,14 @@ class LearnModel():
     def wait_for_stable(self, q, q_window_name=None):
         prev_frame=None
         is_first=True
-        maxlen=50
+        stability=0
+        maxlen=Config.FPS*5
         dq=deque([], maxlen)
         
         w=Config.VIDEO_WIDTH
         h=Config.VIDEO_HEIGHT
 
-        nsamples=100
+        nsamples=500
         widx=np.random.randint(w, size=nsamples)
         hidx=np.random.randint(h, size=nsamples)
 
@@ -772,7 +834,7 @@ class LearnModel():
                 vframe=q.popleft()
                 frame=vframe.frame
                 if q_window_name:
-                    show_frame(detect=frame)
+                    show_frame(org=frame, detect=frame)
             except IndexError:
                 # time.sleep(0.01)
                 continue
@@ -782,13 +844,20 @@ class LearnModel():
                 is_first=False
                 continue
             # if nskip % 5 == 0:
-            dq.append(((frame[hidx[:nsamples], widx[:nsamples], :] - prev_frame[hidx[:nsamples], widx[:nsamples], :]) ** 2).mean(axis=None))
+            # mse=((frame[hidx, widx[:nsamples], :] - prev_frame[hidx[:nsamples], widx[:nsamples], :]) ** 2).mean(axis=None)
+            mse=((frame[hidx, widx, :] - prev_frame[hidx, widx, :]) ** 2).mean(axis=None)
+            dq.append(mse)
             prev_frame=frame
-            # print('fetch frame')
+            # logging.info('fetch frame')
             if len(dq) == maxlen:
                 v=np.var(dq)
-                print(f'wait_for_stable : {v}')
+                logging.info(f'var={v:.2f} stability={stability}')
                 if v < 40.0:
+                    stability+=1
+                else:
+                    stability=0
+
+                if stability > 10:
                     return
             # nskip+=1
 
@@ -798,10 +867,10 @@ class LearnModel():
         imagemodel=ImageModel()
 
         if wait_until_stable:
-            print('Waiting for scene stable')
+            logging.info('Waiting for scene stable')
             self.wait_for_stable(q, q_window_name)
 
-        print('learning ... ', end='')
+        logging.info('learning ... ')
         ref_count=0
         alpha=0
         while ref_count < self.n:
@@ -815,7 +884,7 @@ class LearnModel():
             frame_gray=SegmentObject.get_gray_image(roi_frame)
 
             ref_count+=1
-            # print(f'ref_count={ref_count}/{self.n}')
+            # logging.info(f'ref_count={ref_count}/{self.n}')
             if ref_count == 1:
                 imagemodel.pixel=frame_gray
                 imagemodel.feature=ImageModel.extract_feature(frame_gray)
@@ -839,7 +908,7 @@ class LearnModel():
                 # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
                 #     break
 
-        print('done')
+        logging.info('done')
 
         return imagemodel
 
@@ -885,9 +954,9 @@ def main(argv):
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                      level=logging.INFO)
 
-    # addr='act4.avi'
-    with open('address.txt') as fd:
-        addr=fd.readline().strip()
+    addr='act4.avi'
+    # with open('address.txt') as fd:
+    #     addr=fd.readline().strip()
     Config.video_src=addr
 
     # model from file
@@ -919,6 +988,12 @@ def main(argv):
 
 if __name__ == '__main__':
 
+    logging.basicConfig(level=logging.INFO,
+                    #    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                       format='%(asctime)s : %(funcName)s : %(message)s')
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
 
     main(sys.argv)
 

@@ -46,7 +46,7 @@ class Config():
     TG_CHAT_ID=None
     TG_TOKEN=None
     MAX_IOU=0.02
-    send_video=False
+    send_video=True
     statemodel=None
     imagemodel=None
     video_src=None
@@ -253,8 +253,10 @@ class StateManager():
         #     # imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
         #     return imagemodel
 
+        output_disp_size=40
+
         # if color is changed, write previous frame
-        if color_changed and self.__determine_writing():
+        if color_changed and self.__determine_writing(None, None):
             self.__write_frames(frame.shape[1], frame.shape[2], self.framebuf)
             self.nhistory=self.max_nhistory
             self.framebuf=[]
@@ -271,15 +273,14 @@ class StateManager():
         # pseq=np.array(self.statemodel.predict(seq))
 
         seq=np.array([ float(frame.objstate) for frame in self.framebuf ])
-        wlen=min(7, nframebuf)
+        wlen=min(7, len(self.framebuf))
         T=1./wlen
         w=np.ones(wlen)
         pseq=np.convolve(w/w.sum(), seq, mode='same')
         
-        output_disp_size=40
         z=output_disp_size/len(pseq)
         pseqs=interpolation.zoom(pseq, z)
-        logging.info(f"pseq={''.join(map(lambda x : '1' if x > T else '0', pseqs))}")
+        logging.info(f"pseq={''.join(map(lambda x : '1' if x >= T else '0', pseqs))}")
 
         if wlen > 1:
             self.cur_state=pseq[-1]
@@ -302,7 +303,7 @@ class StateManager():
             self.nhistory+=1
         # PRESENT -> ABSENT
         elif self.prev_state >= T and self.cur_state < T:
-            if self.__determine_writing():
+            if self.__determine_writing(pseq, T):
                 self.__write_frames(frame.shape[1], frame.shape[2], self.framebuf)
             self.nhistory=self.max_nhistory
             self.framebuf=[]
@@ -322,32 +323,55 @@ class StateManager():
         th.start()        
     
 
-    def __determine_writing(self):
+    def __determine_writing(self, pseq, T0):
 
         do_write=False
 
+        classification={}
+        
         # 2 sec
-        T1=Config.FPS * 2
+        T1=Config.FPS
+        T2=T1
+        T3=30
+
+        # if pseq is None:
+        #     logging.info(f'pseq={pseq}')
+        #     return False
 
         # framebuf size < T
         nframebuf=len(self.framebuf)
         if nframebuf < T1:
             logging.info(f'nframebuf={nframebuf}/{T1}')
             return False
+        classification['nframebuf']=nframebuf
 
         # # object in framebuf lasts < T/2 
         # states=[ f.objstate > 0 for f in self.framebuf ]
+        # from back to start, longest segment is larger than T/2
+        if pseq is not None:
+            validobj=0
+            for p in range(len(pseq), 0, -1):
+                if p > T0:
+                    validobj+=1
+                else:
+                    break
+
+            if validobj < T2:
+                logging.info(f'validobj={validobj}/{T2}')
+                return False
+
+            classification['validobj']=validobj
 
         # Last written time < T 
         now=datetime.datetime.now()
         d=now-self.last_writing_time
         self.last_writing_time=now
-        T2=5
-        if d.seconds < 5:
-            logging.info(f'last written time={nframebuf}/{T2}')
+        if d.seconds < T3:
+            logging.info(f'last written time={d.seconds}/{T3}')
             return False
+        classification['last written time']=d.seconds
 
-        logging.info(f'Writing file')
+        logging.info(f'Writing file : {classification}')
         return True  
 
 
@@ -510,8 +534,13 @@ class SegmentObject():
         # logging.info(f'sum(difference): {np.sum(difference)}')
         # cv2.imshow('difference:absdiff', difference)
 
-        # _, difference=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        _, difference=cv2.threshold(difference, 35, 255, cv2.THRESH_BINARY)
+        # otsu
+        _, difference=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        # global threshold
+        # _, difference=cv2.threshold(difference, 35, 255, cv2.THRESH_BINARY)
+        # adaptive
+        # difference=cv2.adaptiveThreshold(difference, 255, cv2.ADAPTIVE_THRESH_MEAN_C,\
+        #     cv2.THRESH_BINARY,11,2)
         # cv2.imshow('difference:threshold', difference)
 
         # difference=cv2.adaptiveThreshold(difference, 245, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 0)
@@ -954,10 +983,13 @@ def main(argv):
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                      level=logging.INFO)
 
-    addr='act4.avi'
-    # with open('address.txt') as fd:
-    #     addr=fd.readline().strip()
-    Config.video_src=addr
+    if len(argv) > 1:
+        addr=argv[1]
+    else:
+        # addr='act4.avi'
+        with open('address.txt') as fd:
+            addr=fd.readline().strip()
+        Config.video_src=addr
 
     # model from file
     # ref='ref1.mp4'

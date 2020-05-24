@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 import cv2
 import numpy as np
 import threading
@@ -64,6 +62,12 @@ class State():
     LEFT=4
 
 
+class FrameWriteMode():
+    IGNORE=0
+    SINGLE=1
+    APPEND=2
+
+
 def width(roi):
     return roi[2]-roi[0]
 
@@ -91,7 +95,7 @@ def get_roi_frame(frame):
     return frame[y:y+h, x:x+w]
 
 
-def show_frame(org=None, detect=None, model=None, difference=None, waitKey=True):
+def show_frame(org=None, detect=None, model=None, threshold=None, difference=None, waitKey=True):
 
     if org is not None:
         cv2.imshow(Config.video_src, org)
@@ -99,6 +103,8 @@ def show_frame(org=None, detect=None, model=None, difference=None, waitKey=True)
         cv2.imshow('Detector', detect)
     if model is not None:
         cv2.imshow('Model', model)
+    if threshold is not None:
+        cv2.imshow('Threshold', threshold)
     if difference is not None:
         cv2.imshow('Difference', difference)
 
@@ -113,7 +119,7 @@ def create_image_window():
     wm, hm=(5, 35)
     nw, nh=(int(Config.VIDEO_WIDTH*scale), int(Config.VIDEO_HEIGHT*scale))
     rnw, rnh=(int(width(Config.ROI)*scale), int(height(Config.ROI)*scale))
-    wn=[Config.video_src, 'Detector', 'Model', 'Difference']
+    wn=[Config.video_src, 'Detector', 'Model', 'Difference', 'Threshold']
     
     flags=cv2.WINDOW_NORMAL|cv2.WINDOW_GUI_EXPANDED|cv2.WINDOW_KEEPRATIO
 
@@ -122,16 +128,20 @@ def create_image_window():
     cv2.resizeWindow(wn[0], nw, nh)
 
     cv2.namedWindow(wn[1], flags)
-    cv2.moveWindow(wn[1], 0, nh+hm)
+    cv2.moveWindow(wn[1], nw+wm, 0)
     cv2.resizeWindow(wn[1], nw, nh)
 
     cv2.namedWindow(wn[2], flags)
-    cv2.moveWindow(wn[2], nw+wm, 0)
+    cv2.moveWindow(wn[2], 0, nh+hm)
     cv2.resizeWindow(wn[2], rnw, rnh)
 
     cv2.namedWindow(wn[3], flags)
-    cv2.moveWindow(wn[3], nw+wm, nh+hm)
+    cv2.moveWindow(wn[3], rnw+wm, nh+hm)
     cv2.resizeWindow(wn[3], rnw, rnh)
+
+    cv2.namedWindow(wn[4], flags)
+    cv2.moveWindow(wn[4], 2*(rnw+wm), nh+hm)
+    cv2.resizeWindow(wn[4], rnw, rnh)
 
     # now supported
     # cv2.displayStatusBar(wn[0], datetime.datetime.now().isoformat())
@@ -207,20 +217,21 @@ class ImageModel():
     # frame: gray scale
     @staticmethod
     def extract_feature(frame):
-        hist1, bins=np.histogram(frame.flatten(), 64, [0, 256])
-        wlen=3
-        T=1./wlen
-        w=np.ones(wlen)
-        pseq=np.convolve(w/w.sum(), hist1, mode='same')
-        return pseq
+        # hist1, bins=np.histogram(frame.flatten(), 64, [0, 256])
+        # wlen=3
+        # T=1./wlen
+        # w=np.ones(wlen)
+        # pseq=np.convolve(w/w.sum(), hist1, mode='same')
+        # return pseq
+        return None
 
 
 class StateManager():
     def __init__(self, statemodel, nhistory):
         self.max_nhistory=Config.MAX_NHISTORY
         self.nhistory=nhistory
-        self.clear()
         self.statemodel=statemodel
+        self.clear()
 
     def clear(self):
         self.cur_state=State.UNKNOWN
@@ -230,7 +241,8 @@ class StateManager():
         self.nhistorystack=[]
         self.pool_sema = BoundedSemaphore(value=1)
         self.last_writing_time=datetime.datetime.today().replace(hour=0, minute=0, second=0)
-
+        self.write_frame_q=None
+        self.timer=None
 
     def stop_writing_thread(self):
         exitthreadcount=0
@@ -256,8 +268,13 @@ class StateManager():
         output_disp_size=40
 
         # if color is changed, write previous frame
-        if color_changed and self.__determine_writing(None, None):
-            self.__write_frames(frame.shape[1], frame.shape[2], self.framebuf)
+        # if color_changed and self.__determine_writing(None, None) in [FrameWriteMode.SINGLE, FrameWriteMode.APPEND]:
+        #     if self.write_frame_q is None:
+        #         self.write_frame_q=Queue()
+        #         for f in self.framebuf:
+        #             self.write_frame_q.put(f)
+        #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
+        if color_changed:
             self.nhistory=self.max_nhistory
             self.framebuf=[]
 
@@ -273,7 +290,7 @@ class StateManager():
         # pseq=np.array(self.statemodel.predict(seq))
 
         seq=np.array([ float(frame.objstate) for frame in self.framebuf ])
-        wlen=min(7, len(self.framebuf))
+        wlen=min(9, len(self.framebuf))
         T=1./wlen
         w=np.ones(wlen)
         pseq=np.convolve(w/w.sum(), seq, mode='same')
@@ -303,18 +320,35 @@ class StateManager():
             self.nhistory+=1
         # PRESENT -> ABSENT
         elif self.prev_state >= T and self.cur_state < T:
-            if self.__determine_writing(pseq, T):
-                self.__write_frames(frame.shape[1], frame.shape[2], self.framebuf)
+            writing_mode=self.__determine_writing(pseq, T)
+            if writing_mode==FrameWriteMode.SINGLE:
+                logging.info(f'FrameWriteMode.SINGLE')
+                self.write_frame_q=Queue()
+                for f in self.framebuf:
+                    self.write_frame_q.put(f)
+                self.timer=threading.Timer(3.0, self.__write_frames, args=(frame.shape[1], frame.shape[2], self.write_frame_q))
+                self.timer.start()
+            elif writing_mode==FrameWriteMode.APPEND:
+                logging.info(f'FrameWriteMode.APPEND')
+                for f in self.framebuf:
+                    self.write_frame_q.put(f)
+                if self.timer.is_alive():
+                    self.timer.cancel()
+                self.timer=threading.Timer(3.0, self.__write_frames, args=(frame.shape[1], frame.shape[2], self.write_frame_q))
+            elif writing_mode==FrameWriteMode.IGNORE:
+                logging.info(f'FrameWriteMode.IGNORE')
+                # if len(self.write_frame_q) > 0:
+                #     logging.info(f'Writing non empty frames')
+                #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
+                self.write_frame_q.clear()
+
             self.nhistory=self.max_nhistory
             self.framebuf=[]
 
         return imagemodel
 
 
-    def __write_frames(self, w, h, framebuf):
-        q=Queue(len(framebuf))
-        for item in framebuf:
-            q.put(copy.copy(item))
+    def __write_frames(self, w, h, q):
         th=WriteThread(name=f'WriteThread{len(self.threadlist)}', 
             # args=(q, frame.shape[1], frame.shape[2], 'Object detected', self.pool_sema))
             args=(q, w, h, 'Object detected', self.pool_sema))
@@ -332,17 +366,14 @@ class StateManager():
         # 2 sec
         T1=Config.FPS
         T2=T1
-        T3=30
-
-        # if pseq is None:
-        #     logging.info(f'pseq={pseq}')
-        #     return False
+        # 30 seconds
+        T3=3
 
         # framebuf size < T
         nframebuf=len(self.framebuf)
         if nframebuf < T1:
             logging.info(f'nframebuf={nframebuf}/{T1}')
-            return False
+            return FrameWriteMode.IGNORE
         classification['nframebuf']=nframebuf
 
         # # object in framebuf lasts < T/2 
@@ -358,7 +389,7 @@ class StateManager():
 
             if validobj < T2:
                 logging.info(f'validobj={validobj}/{T2}')
-                return False
+                return FrameWriteMode.IGNORE
 
             classification['validobj']=validobj
 
@@ -368,11 +399,11 @@ class StateManager():
         self.last_writing_time=now
         if d.seconds < T3:
             logging.info(f'last written time={d.seconds}/{T3}')
-            return False
+            return FrameWriteMode.APPEND
         classification['last written time']=d.seconds
 
         logging.info(f'Writing file : {classification}')
-        return True  
+        return FrameWriteMode.SINGLE  
 
 
 class MainController():
@@ -535,9 +566,9 @@ class SegmentObject():
         # cv2.imshow('difference:absdiff', difference)
 
         # otsu
-        _, difference=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        # _, difference=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
         # global threshold
-        # _, difference=cv2.threshold(difference, 35, 255, cv2.THRESH_BINARY)
+        _, difference_t=cv2.threshold(difference, 35, 255, cv2.THRESH_BINARY)
         # adaptive
         # difference=cv2.adaptiveThreshold(difference, 255, cv2.ADAPTIVE_THRESH_MEAN_C,\
         #     cv2.THRESH_BINARY,11,2)
@@ -546,17 +577,17 @@ class SegmentObject():
         # difference=cv2.adaptiveThreshold(difference, 245, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 0)
 
         kernel = np.ones((7,7),np.uint8)
-        difference=cv2.dilate(difference, kernel)
+        difference_t=cv2.dilate(difference_t, kernel)
         kernel = np.ones((5,5),np.uint8)
-        difference=cv2.erode(difference, kernel)
-        
-        show_frame(difference=cv2.imshow('Difference', difference))
+        difference_t=cv2.erode(difference_t, kernel)
+
+        show_frame(threshold=difference_t, difference=difference)
 
         lbound=200
         ubound=255
-        mask=cv2.inRange(difference, lbound, ubound)
+        mask=cv2.inRange(difference_t, lbound, ubound)
 
-        return roi_frame, difference, mask
+        return roi_frame, difference_t, mask
 
 
     # constraint_function: lambda x : x + (roix, roiy)
@@ -605,9 +636,9 @@ class ObjectDetector(SegmentObject):
         roi_frame, difference, mask=self.segment()
         ious, sumiou, maxiou=self.__find_iou(self.contours)
 
-        local_feature=np.array(ious[:3])
-        instance_feature=self.__extract_feature(roi_frame)
-        feature_score=self.__match_sequence(self.imagemodel.feature, instance_feature)
+        # local_feature=np.array(ious[:3])
+        # instance_feature=self.__extract_feature(roi_frame)
+        # feature_score=self.__match_sequence(self.imagemodel.feature, instance_feature)
 
         classifier['maxiou']=maxiou > Config.MAX_IOU
         classifier['sumiou']=sumiou < 0.3
@@ -788,6 +819,7 @@ class WriteThread(threading.Thread):
         s=re.sub('[-:]', '', s)
         fn='detected/'+s+".mp4"    
 
+        logging.info(f'Writing {fn}')
         with self.sema:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')    
             vcap_out = cv2.VideoWriter(fn, fourcc, Config.WRITE_FPS, (Config.VIDEO_WIDTH, Config.VIDEO_HEIGHT))
@@ -945,7 +977,7 @@ class LearnModel():
     @staticmethod
     def update_model(imagemodel, instanceimage):
         imagemodel.pixel=LearnModel.update_mean(imagemodel.pixel, instanceimage.pixel, imagemodel.alpha)
-        imagemodel.hist=LearnModel.update_mean(imagemodel.feature, instanceimage.feature, imagemodel.alpha)
+        # imagemodel.hist=LearnModel.update_mean(imagemodel.feature, instanceimage.feature, imagemodel.alpha)
         return imagemodel
 
     @staticmethod
@@ -984,12 +1016,12 @@ def main(argv):
                      level=logging.INFO)
 
     if len(argv) > 1:
-        addr=argv[1]
+        addr=argv[1].strip()
     else:
         # addr='act4.avi'
         with open('address.txt') as fd:
             addr=fd.readline().strip()
-        Config.video_src=addr
+    Config.video_src=addr
 
     # model from file
     # ref='ref1.mp4'

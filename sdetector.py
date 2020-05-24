@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import cv2
 import numpy as np
 import threading
@@ -907,7 +909,8 @@ def main(argv):
         with open('hmm.json', 'rt') as fd:
             # js=json.load(fd)
             js=fd.read()
-            Config.statemodel=HiddenMarkovModel.from_json(js)
+            # Config.statemodel=HiddenMarkovModel.from_json(js)
+            Config.statemodel=None
 
     controller=MainController(Config.statemodel, Config.imagemodel)
 

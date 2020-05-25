@@ -6,3 +6,4 @@ data/
 detected/
 address.txt
 venv/
+config.json

@@ -1,3 +1,5 @@
+# encoding: utf-8
+# import cProfile
 import cv2
 import numpy as np
 import threading
@@ -24,19 +26,23 @@ import sys
 import random
 import logging
 from scipy.ndimage import interpolation
+import imutils
 
 
 class Config():
 
     FPS=10
     WRITE_FPS=10
+    SET_FRAME_SCALE=0.5
     # 20 frames/sec * 30sec
     MAX_CAPTURE_BUFFER=FPS*60
     MAX_TIMELINE=5*FPS
     MAX_LEARN_FRAMES=FPS*3
     MAX_NHISTORY=FPS*5
      # 1 minute
-    ROI=[444, 0, 1055, 720]
+    ROI=[495, 0, 924, 680]
+    VIDEO_ORG_WIDTH=-1
+    VIDEO_ORG_HEIGHT=-1
     VIDEO_WIDTH=-1
     VIDEO_HEIGHT=-1
     MAX_COLOR_SAMPLES=100
@@ -44,11 +50,10 @@ class Config():
     TG_CHAT_ID=None
     TG_TOKEN=None
     MAX_IOU=0.02
-    send_video=True
+    send_video=False
     statemodel=None
     imagemodel=None
     video_src=None
-
 
     tg_video_q=Queue()
     tg_bot=None
@@ -66,6 +71,33 @@ class FrameWriteMode():
     IGNORE=0
     SINGLE=1
     APPEND=2
+
+
+class FPS:
+	def __init__(self):
+		# store the start time, end time, and total number of frames
+		# that were examined between the start and end intervals
+		self._start = None
+		self._end = None
+		self._numFrames = 0
+	def start(self):
+		# start the timer
+		self._start = datetime.datetime.now()
+		return self
+	def stop(self):
+		# stop the timer
+		self._end = datetime.datetime.now()
+	def update(self):
+		# increment the total number of frames examined during the
+		# start and end intervals
+		self._numFrames += 1
+	def elapsed(self):
+		# return the total number of seconds between the start and
+		# end interval
+		return (self._end - self._start).total_seconds()
+	def fps(self):
+		# compute the (approximate) frames per second
+		return self._numFrames / self.elapsed()
 
 
 def width(roi):
@@ -115,7 +147,7 @@ def show_frame(org=None, detect=None, model=None, threshold=None, difference=Non
 
 
 def create_image_window():
-    scale=0.4
+    scale=1.0
     wm, hm=(5, 35)
     nw, nh=(int(Config.VIDEO_WIDTH*scale), int(Config.VIDEO_HEIGHT*scale))
     rnw, rnh=(int(width(Config.ROI)*scale), int(height(Config.ROI)*scale))
@@ -188,7 +220,7 @@ class VideoFrame():
     def __init__(self, frame, objstate=State.ABSENT):
         self.frame=frame
         self.objstate=objstate
-        self.msec=0
+        self.createdtime=datetime.datetime.now().timestamp()
         self.iframes=0
         self.is_ir=None
 
@@ -323,15 +355,15 @@ class StateManager():
             writing_mode=self.__determine_writing(pseq, T)
             if writing_mode==FrameWriteMode.SINGLE:
                 logging.info(f'FrameWriteMode.SINGLE')
-                self.write_frame_q=Queue()
+                self.write_frame_q=deque()
                 for f in self.framebuf:
-                    self.write_frame_q.put(f)
+                    self.write_frame_q.append(f)
                 self.timer=threading.Timer(3.0, self.__write_frames, args=(frame.shape[1], frame.shape[2], self.write_frame_q))
                 self.timer.start()
             elif writing_mode==FrameWriteMode.APPEND:
                 logging.info(f'FrameWriteMode.APPEND')
                 for f in self.framebuf:
-                    self.write_frame_q.put(f)
+                    self.write_frame_q.append(f)
                 if self.timer.is_alive():
                     self.timer.cancel()
                 self.timer=threading.Timer(3.0, self.__write_frames, args=(frame.shape[1], frame.shape[2], self.write_frame_q))
@@ -340,7 +372,9 @@ class StateManager():
                 # if len(self.write_frame_q) > 0:
                 #     logging.info(f'Writing non empty frames')
                 #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
-                self.write_frame_q.clear()
+                if self.write_frame_q is not None:
+                    while not self.write_frame_q.empty():
+                        self.write_frame_q.get()
 
             self.nhistory=self.max_nhistory
             self.framebuf=[]
@@ -423,24 +457,6 @@ class MainController():
         self.prev_frame_ir=None
 
 
-        # dim=[(nw, nh), 
-        #     (nw, nh), 
-        #     (int(width(Config.ROI)*scale), int(height(Config.ROI)*scale)),
-        #     (int(width(Config.ROI)*scale), int(height(Config.ROI)*scale))
-        #     ]
-
-        # off=[(0, 0)]
-        # for i in range(len(wn)-1):
-        #     v=(dim[0][0]+margin, 0), (dim[0][0]+dim[1][0]+2*margin, 0)]
-        #     off.append(v)
-            
-        # for i, w in enumerate(wn):
-        #     cv2.namedWindow(w, cv2.WINDOW_NORMAL)
-        #     cv2.resizeWindow(w, dim[i][0], dim[i][1])
-
-        # cv2.moveWindow(w, off[i][0], off[i][1])
-
-
     def __learn(self, q):
         learner=LearnModel(self.max_learn_frames)
         self.imagemodel=learner.learn(q, q_window_name=Config.video_src)
@@ -484,12 +500,7 @@ class MainController():
                 prev_frame=frame
                 frame=vframe.frame
 
-                # plt.subplot(1, 3, 1)
-                # cv2.imshow(Config.video_src, frame)
-                # plt.show()
-
-                # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
-                if not show_frame(frame):
+                if not show_frame(org=frame, waitKey=False):
                     logging.info('Stopping capture')
                     self.stop_event.set()
                     continue
@@ -528,6 +539,11 @@ class MainController():
             #     self.stop_event.set()
             #     break
             self.__determine_action(frame, roi_frame, detect_result, color_changed)
+
+            now=datetime.datetime.now()
+            c=datetime.datetime.fromtimestamp(vframe.createdtime)
+            d0=now-c
+            logging.info(f'createdtime:{c.isoformat()}, processed={d0.seconds}')
 
 
     def is_color_changed(self, cur_frame_ir, frame):
@@ -717,7 +733,7 @@ class ObjectDetector(SegmentObject):
             cv2.putText(frame, f"{iou:.2f}", (x0, y0-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, clr)
         cv2.drawContours(frame, self.contours, -1, (0, 255, 0), thickness=cv2.FILLED)
         cv2.rectangle(frame, (Config.ROI[0], Config.ROI[1]), (Config.ROI[2], Config.ROI[3]), (220, 220, 220), 2)
-        cv2.putText(frame, f'msec: {vframe.msec/1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
+        cv2.putText(frame, f'msec: {vframe.createdtime/1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
         cv2.putText(frame, f'iframes: {vframe.iframes}', (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
 
     def __bb_intersection_over_union(self, boxA, boxB):
@@ -752,27 +768,44 @@ class CaptureThread(threading.Thread):
         self.capture_started_event=args[2]
 
 
+    def __read_video_params(self, vcap):
+
+        Config.FPS=int(vcap.get(cv2.CAP_PROP_FPS))
+        Config.VIDEO_ORG_WIDTH=int(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        Config.VIDEO_ORG_HEIGHT=int(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        Config.VIDEO_WIDTH=int(Config.VIDEO_ORG_WIDTH*Config.SET_FRAME_SCALE+0.5)
+        Config.VIDEO_HEIGHT=int(Config.VIDEO_ORG_HEIGHT*Config.SET_FRAME_SCALE+0.5)
+        Config.ROI=(Config.SET_FRAME_SCALE*np.array(Config.ROI)).astype(np.int).tolist()
+
+
     def run(self):
         logging.info('connecting to device ...')
-        vcap_act = cv2.VideoCapture(Config.video_src)
+        vcap = cv2.VideoCapture(Config.video_src)
         logging.info('connected ...')
 
-        Config.VIDEO_WIDTH=int(vcap_act.get(3))
-        Config.VIDEO_HEIGHT=int(vcap_act.get(4))
+        fps=FPS()
+
+        self.__read_video_params(vcap)
+
+        # not working
+        # vcap.set(cv2.CAP_PROP_FPS, 5)
+        # fps=vcap.get(cv2.CAP_PROP_FPS)
 
         self.capture_started_event.set()
 
         start_msec=datetime.datetime.now().timestamp()
+        fps.start()
 
         # frame_skipped=False
         while not self.stop_event.wait(0.001):
-            ret, frame = vcap_act.read()
-            if not(ret):
-                vcap_act.release()
-                vcap_act = cv2.VideoCapture(Config.video_src)
-                continue
+            ret, frame = vcap.read()
+            if not ret:
+                # vcap.release()
+                # vcap = cv2.VideoCapture(Config.video_src)
+                # continue
+                break
 
-            if frame is None:
+            if frame is None or len(frame) < 1:
                 self.capture_started_event.clear()
                 break
 
@@ -787,18 +820,22 @@ class CaptureThread(threading.Thread):
 
             # s=datetime.datetime.now().isoformat()
             # cv2.putText(frame, f"{s}", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
+            
+            frame=imutils.resize(frame, Config.VIDEO_WIDTH)
             vframe=VideoFrame(frame)
+            fps.update()
 
-            vframe.iframes=vcap_act.get(cv2.CAP_PROP_POS_FRAMES)
-            vframe.msec=start_msec+vcap_act.get(cv2.CAP_PROP_POS_MSEC)
-
-            if vframe.msec > 0:
-                fps = vframe.iframes / (vframe.msec / 1000.)
-                # logging.info(f'fps: {fps}')
+            # vframe.iframes=vcap.get(cv2.CAP_PROP_POS_FRAMES)
+            # # vframe.createdtime=start_msec+vcap.get(cv2.CAP_PROP_POS_MSEC)
+            # if vframe.createdtime > 0:
+            #     fps = vframe.iframes / (vframe.createdtime / 1000.)
+            #     # logging.info(f'fps: {fps}')
             
             self.q.append(vframe)
+            fps.stop()
+            logging.info(f'input fps : {fps.fps()}')
 
-        vcap_act.release()
+        vcap.release()
 
         logging.info("capture stopped")
 
@@ -813,7 +850,17 @@ class WriteThread(threading.Thread):
         self.info=args[3]
         self.sema=args[4]
 
+
+    def __estimate_fps(self):
+        q=self.q
+        fps=1000./np.mean(np.diff(np.array([ v.createdtime*1000 for v in q ])))
+
+        return fps
+
+
     def run(self):
+        n=len(self.q)
+
         # logging.info(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
         s=datetime.datetime.now().replace(microsecond=0).isoformat()
         s=re.sub('[-:]', '', s)
@@ -821,21 +868,22 @@ class WriteThread(threading.Thread):
 
         logging.info(f'Writing {fn}')
         with self.sema:
+            fps=self.__estimate_fps()
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')    
-            vcap_out = cv2.VideoWriter(fn, fourcc, Config.WRITE_FPS, (Config.VIDEO_WIDTH, Config.VIDEO_HEIGHT))
+            vcap_out = cv2.VideoWriter(fn, fourcc, fps, (Config.VIDEO_WIDTH, Config.VIDEO_HEIGHT))
 
             end_msec=0
             start_msec=-1
-            while not self.q.empty():
-                videoframe=self.q.get()
+            while len(self.q) > 0:
+                videoframe=self.q.popleft()
                 # time.sleep(10)
                 vcap_out.write(videoframe.frame)
                 # logging.info(f'{threading.get_ident()} : {self.q.qsize()}')
 
                 if start_msec < 0:
-                    start_msec=videoframe.msec
-                if self.q.empty():
-                    end_msec=videoframe.msec
+                    start_msec=videoframe.createdtime
+                if len(self.q) < 1:
+                    end_msec=videoframe.createdtime
 
             vcap_out.release()
             # write_event.clear()
@@ -879,7 +927,7 @@ class LearnModel():
         prev_frame=None
         is_first=True
         stability=0
-        maxlen=Config.FPS*5
+        maxlen=int(Config.FPS*5)
         dq=deque([], maxlen)
         
         w=Config.VIDEO_WIDTH
@@ -894,8 +942,6 @@ class LearnModel():
             try:
                 vframe=q.popleft()
                 frame=vframe.frame
-                if q_window_name:
-                    show_frame(org=frame, detect=frame)
             except IndexError:
                 # time.sleep(0.01)
                 continue
@@ -922,6 +968,9 @@ class LearnModel():
                     return
             # nskip+=1
 
+            if q_window_name:
+                show_frame(org=frame, detect=frame)
+                logging.info(f'orgframe={vframe.createdtime}')
 
     def learn(self, q, q_window_name=None, wait_until_stable=True):
 
@@ -1010,6 +1059,11 @@ def send_video(v):
         timeout=120)
 
 
+def read_video_source(filename):
+
+    pass
+
+
 def main(argv):
 
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -1017,10 +1071,14 @@ def main(argv):
 
     if len(argv) > 1:
         addr=argv[1].strip()
+        if not os.path.exists(addr):
+            logging.error(f'Invalid file: {addr}')
+            return
     else:
         # addr='act4.avi'
         with open('address.txt') as fd:
             addr=fd.readline().strip()
+
     Config.video_src=addr
 
     # model from file
@@ -1058,6 +1116,11 @@ if __name__ == '__main__':
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
+
+
+    os.environ['DISPLAY'] = ':0'
+
+    # cProfile.run('main(sys.argv)')
 
     main(sys.argv)
 

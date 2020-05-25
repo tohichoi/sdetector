@@ -30,31 +30,36 @@ def show_distribution(data, pdf, color, *args):
     # plt.title(title)
 
 
+'''
+array([[[63, 54, 37],
+        [54, 45, 28]],
+
+       [[50, 41, 24],
+        [67, 58, 41]]], dtype=uint8)
+
+np.diff(ccdf[0:2, 0:2].astype(np.int16))
+array([[[ -9, -17],
+        [ -9, -17]],
+
+       [[ -9, -17],
+        [ -9, -17]]], dtype=int16)
+
+np.sum(np.diff(ccdf[0:2, 0:2].astype(np.int16)), axis=2).flatten()
+array([-26, -26, -26, -26])
+'''
 def get_pixel_statistics(img, nsamples):
     w=img.shape[1]
     h=img.shape[0]
-    widx=list(range(w))
-    hidx=list(range(h))
 
-    random.shuffle(widx)
-    random.shuffle(hidx)
+    widx=np.random.randint(w, size=nsamples)
+    hidx=np.random.randint(h, size=nsamples)
 
-    var=[]
-    for x, y in zip(widx[:nsamples], hidx[:nsamples]):
-        px=img[y, x].astype(int)
-        epx=[px[0], px[1], px[2], px[0]]
-        d=0
-        for i in range(len(epx)-1):
-            d+=abs(epx[i]-epx[i+1])
-        var.append(d)
-        # var.append(np.var(px)+10e-5)
-
-    return var
+    return np.sum(np.diff(img[hidx, widx, :].astype(np.int16)), axis=1).flatten()
     
+ 
+def read_image_filelist(filelist):
 
-def read_images(filelist):
-
-    data=[]
+    images=[]
     with open(filelist) as fd:
         for line in fd.readlines():
             filename=line.strip()
@@ -66,7 +71,16 @@ def read_images(filelist):
                 continue
 
             img=read_image(filename)
-            data=data+get_pixel_statistics(img, 200)
+            images.append(img)
+
+    return images
+
+
+def read_images(filelist):
+
+    data=[]
+    images=read_image_filelist()
+    data=list(map(lambda x : get_pixel_statistics(x, 200), images))
 
     return data
 

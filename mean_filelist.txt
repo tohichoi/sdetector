@@ -1,0 +1,6 @@
+./kmeans-centroid/P20051421505610.jpg
+./kmeans-centroid/P20051421541510.jpg
+./kmeans-centroid/P20051421552010.jpg
+./kmeans-centroid/P20051423375210.jpg
+./kmeans-centroid/P20051515074210.jpg
+./kmeans-centroid/P20051521034910.jpg

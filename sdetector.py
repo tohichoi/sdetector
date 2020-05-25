@@ -378,7 +378,7 @@ class StateManager():
                 #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
                 if self.write_frame_q is not None:
                     while len(self.write_frame_q) > 0:
-                        self.write_frame_q.get()
+                        self.write_frame_q.popleft()
 
             self.nhistory=self.max_nhistory
             self.framebuf=[]
@@ -549,7 +549,7 @@ class MainController():
             c=datetime.datetime.fromtimestamp(vframe.createdtime)
             d0=now-c
             if timelogcount % 100 == 0:
-                logging.info(f'createdtime:{c.isoformat()}, processed={d0.seconds}')
+                logging.info(f'processed frame :{c.isoformat()}, delay(sec)={d0.seconds}')
                 timelogcount=0
             timelogcount+=1                
 
@@ -803,7 +803,7 @@ class CaptureThread(threading.Thread):
         start_msec=datetime.datetime.now().timestamp()
         fps.start()
 
-        # frame_skipped=False
+        frame_skip=0
         while not self.stop_event.wait(0.001):
             ret, frame = vcap.read()
             if not ret:
@@ -816,31 +816,15 @@ class CaptureThread(threading.Thread):
                 self.capture_started_event.clear()
                 break
 
-            # if not frame_skipped:
-            #     frame_skipped=True
-            #     continue
-
-            # if len(self.q)==self.q.maxlen:
-            #     logging.info('Capture queue is full. dropping previous frame')
-                # self.q.get()
-                # time.sleep(0.1)
-
-            # s=datetime.datetime.now().isoformat()
-            # cv2.putText(frame, f"{s}", (0, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
-            
-            frame=imutils.resize(frame, Config.VIDEO_WIDTH)
-            vframe=VideoFrame(frame)
-            fps.update()
-
-            # vframe.iframes=vcap.get(cv2.CAP_PROP_POS_FRAMES)
-            # # vframe.createdtime=start_msec+vcap.get(cv2.CAP_PROP_POS_MSEC)
-            # if vframe.createdtime > 0:
-            #     fps = vframe.iframes / (vframe.createdtime / 1000.)
-            #     # logging.info(f'fps: {fps}')
-            
-            self.q.append(vframe)
-            fps.stop()
-            # logging.info(f'input fps : {fps.fps()}')
+            if frame_skip % 3 == 0:
+                frame=imutils.resize(frame, Config.VIDEO_WIDTH)
+                vframe=VideoFrame(frame)
+                fps.update()
+                
+                self.q.append(vframe)
+                fps.stop()
+                # logging.info(f'input fps : {fps.fps()}')
+            frame_skip += 1
 
         vcap.release()
 
@@ -1061,8 +1045,12 @@ def send_video(v):
     # q=Config.tg_video_q
     # while not q.empty():
     #     v=q.get()
+    fn=os.path.basename(v.filename)
+    # d=datetime.datetime.fromtimestamp(v.createdtime, datetime.timezone.utc)
+    msg='동작 감지'
+    Config.tg_bot.send_message(chat_id=Config.TG_CHAT_ID, text=msg)
     Config.tg_bot.send_video(chat_id=Config.TG_CHAT_ID, 
-        caption=os.path.basename(v.filename),
+        caption=fn,
         video=open(v.filename, 'rb'),
         timeout=120)
 
@@ -1125,8 +1113,8 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-
-    os.environ['DISPLAY'] = ':1'
+    if os.environ['OS'] != 'Windows_NT':
+        os.environ['DISPLAY'] = ':1'
 
     # cProfile.run('main(sys.argv)')
 

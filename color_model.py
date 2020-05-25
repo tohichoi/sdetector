@@ -60,6 +60,7 @@ def get_pixel_statistics(img, nsamples):
 def read_image_filelist(filelist):
 
     images=[]
+    filepath=[]
     with open(filelist) as fd:
         for line in fd.readlines():
             filename=line.strip()
@@ -72,8 +73,9 @@ def read_image_filelist(filelist):
 
             img=read_image(filename)
             images.append(img)
+            filepath.append(filename)
 
-    return images
+    return images, filepath
 
 
 def read_images(filelist):

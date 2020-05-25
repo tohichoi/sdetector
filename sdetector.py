@@ -1,6 +1,5 @@
 # encoding: utf-8
 # import cProfile
-import cv2
 import numpy as np
 import threading
 import queue
@@ -15,23 +14,26 @@ import copy
 from color_model import get_pixel_statistics
 from collections import deque
 from matplotlib import pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
+import imutils
+import cv2
 import collections
 from telegram import Bot
 from telegram.ext import Updater
 import logging
 from telegram.ext import CommandHandler
 import json
-from pomegranate import *
+#from pomegranate import *
 import sys
 import random
 import logging
 from scipy.ndimage import interpolation
-import imutils
 
 
 class Config():
 
-    FPS=10
+    FPS=20
     WRITE_FPS=10
     SET_FRAME_SCALE=0.5
     # 20 frames/sec * 30sec
@@ -50,7 +52,7 @@ class Config():
     TG_CHAT_ID=None
     TG_TOKEN=None
     MAX_IOU=0.02
-    send_video=False
+    send_video=True
     statemodel=None
     imagemodel=None
     video_src=None
@@ -229,7 +231,7 @@ class VideoFrame():
         fr=frame if frame is not None else self.frame
         if self.is_ir is None:
             stat=get_pixel_statistics(fr, Config.MAX_COLOR_SAMPLES)
-            r=float(len(list(filter(lambda x : x == 0, stat))))/Config.MAX_COLOR_SAMPLES
+            r=float(len(list(filter(lambda x : x < 5, stat))))/Config.MAX_COLOR_SAMPLES
             self.is_ir = r > 0.95
         return self.is_ir
 
@@ -297,7 +299,7 @@ class StateManager():
         #     # imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
         #     return imagemodel
 
-        output_disp_size=40
+        output_disp_size=50
 
         # if color is changed, write previous frame
         # if color_changed and self.__determine_writing(None, None) in [FrameWriteMode.SINGLE, FrameWriteMode.APPEND]:
@@ -329,13 +331,15 @@ class StateManager():
         
         z=output_disp_size/len(pseq)
         pseqs=interpolation.zoom(pseq, z)
-        logging.info(f"pseq={''.join(map(lambda x : '1' if x >= T else '0', pseqs))}")
 
         if wlen > 1:
             self.cur_state=pseq[-1]
             self.prev_state=pseq[-wlen]
         else:
             self.prev_state=self.cur_state
+
+        if self.prev_state >= T or self.cur_state >= T:
+            logging.info(f"pseq={''.join(map(lambda x : '1' if x >= T else '0', pseqs))}")
 
         # np.set_printoptions(precision=2)
         # logging.info(''.join(list(map(lambda x : 'T' if x > T else '.', pseq.tolist()))))
@@ -373,7 +377,7 @@ class StateManager():
                 #     logging.info(f'Writing non empty frames')
                 #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
                 if self.write_frame_q is not None:
-                    while not self.write_frame_q.empty():
+                    while len(self.write_frame_q) > 0:
                         self.write_frame_q.get()
 
             self.nhistory=self.max_nhistory
@@ -486,6 +490,7 @@ class MainController():
         # fetch frame
         prev_frame=None
         frame=None
+        timelogcount=0
 
         while True:
 
@@ -543,8 +548,10 @@ class MainController():
             now=datetime.datetime.now()
             c=datetime.datetime.fromtimestamp(vframe.createdtime)
             d0=now-c
-            logging.info(f'createdtime:{c.isoformat()}, processed={d0.seconds}')
-
+            if timelogcount % 100 == 0:
+                logging.info(f'createdtime:{c.isoformat()}, processed={d0.seconds}')
+                timelogcount=0
+            timelogcount+=1                
 
     def is_color_changed(self, cur_frame_ir, frame):
         return self.prev_frame_ir != None and self.prev_frame_ir != cur_frame_ir
@@ -770,7 +777,7 @@ class CaptureThread(threading.Thread):
 
     def __read_video_params(self, vcap):
 
-        Config.FPS=int(vcap.get(cv2.CAP_PROP_FPS))
+        # Config.FPS=int(vcap.get(cv2.CAP_PROP_FPS))
         Config.VIDEO_ORG_WIDTH=int(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
         Config.VIDEO_ORG_HEIGHT=int(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         Config.VIDEO_WIDTH=int(Config.VIDEO_ORG_WIDTH*Config.SET_FRAME_SCALE+0.5)
@@ -833,7 +840,7 @@ class CaptureThread(threading.Thread):
             
             self.q.append(vframe)
             fps.stop()
-            logging.info(f'input fps : {fps.fps()}')
+            # logging.info(f'input fps : {fps.fps()}')
 
         vcap.release()
 
@@ -956,6 +963,7 @@ class LearnModel():
             dq.append(mse)
             prev_frame=frame
             # logging.info('fetch frame')
+            # logging.info(f'dqsize: {len(dq)}/{maxlen}')
             if len(dq) == maxlen:
                 v=np.var(dq)
                 logging.info(f'var={v:.2f} stability={stability}')
@@ -970,7 +978,7 @@ class LearnModel():
 
             if q_window_name:
                 show_frame(org=frame, detect=frame)
-                logging.info(f'orgframe={vframe.createdtime}')
+                # logging.info(f'orgframe={vframe.createdtime}')
 
     def learn(self, q, q_window_name=None, wait_until_stable=True):
 
@@ -1118,7 +1126,7 @@ if __name__ == '__main__':
     logger.setLevel(logging.INFO)
 
 
-    os.environ['DISPLAY'] = ':0'
+    os.environ['DISPLAY'] = ':1'
 
     # cProfile.run('main(sys.argv)')
 

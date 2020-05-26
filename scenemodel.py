@@ -57,7 +57,7 @@ class SceneModel():
         # mean_features=self.extract_feature(mean_images)
 
         test_features=self.__reshape_data(np.array(self.extract_features(test_images)))
-        
+
         self.kmeans.predict(test_features)
         L=self.kmeans.labels_
         self.__save_result('test', L, test_filepath)
@@ -80,6 +80,7 @@ class SceneModel():
         return np.transpose(hist)
 
 
-scenemodel=SceneModel()
-scenemodel.learn('mean_filelist.txt', 'train_filelist.txt')
-scenemodel.test('test_filelist.txt')
+if __name__ == '__main__':
+    scenemodel=SceneModel()
+    scenemodel.learn('mean_filelist.txt', 'train_filelist.txt')
+    scenemodel.test('test_filelist.txt')

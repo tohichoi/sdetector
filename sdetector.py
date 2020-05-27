@@ -1,35 +1,28 @@
 # encoding: utf-8
 # import cProfile
-import numpy as np
-import threading
-import queue
 import datetime
-import re
 import os
-from enum import Enum
+import re
+import threading
+import time
+from collections import deque
 from queue import Queue
 from threading import BoundedSemaphore
-import time
-import copy
-from color_model import get_pixel_statistics
-from collections import deque
-from matplotlib import pyplot as plt
+
 import matplotlib
+import numpy as np
 
 matplotlib.use('Agg')
 import imutils
 import cv2
 import collections
 from telegram import Bot
-from telegram.ext import Updater
-import logging
-from telegram.ext import CommandHandler
 import json
 # from pomegranate import *
 import sys
-import random
 import logging
 from scipy.ndimage import interpolation
+from color_model import is_color
 
 
 class Config():
@@ -235,9 +228,7 @@ class VideoFrame():
     def check_ir(self, frame=None):
         fr = frame if frame is not None else self.frame
         if self.is_ir is None:
-            stat = get_pixel_statistics(fr, Config.MAX_COLOR_SAMPLES)
-            r = float(len(list(filter(lambda x: x < 5, stat)))) / Config.MAX_COLOR_SAMPLES
-            self.is_ir = r > 0.95
+            self.is_ir=is_color(frame, Config.MAX_COLOR_SAMPLES)
         return self.is_ir
 
 

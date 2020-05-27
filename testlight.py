@@ -8,7 +8,7 @@ from color_model import *
 
 
 filelist = 'light1.txt'
-images, filepath = read_image_filelist(filelist)
+images, filepath = read_image_from_filelist(filelist)
 
 
 # 전처리

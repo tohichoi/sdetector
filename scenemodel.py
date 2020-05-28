@@ -9,6 +9,7 @@ import json
 import joblib
 import logging
 import sys
+from scipy.special import kl_div
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -115,18 +116,29 @@ class SceneModel():
             features.append(self.extract_feature(f))
         return features
 
-    def extract_feature(self, frame):
+    def extract_feature(self, frame, resize_scale=1):
         frame2 = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        frame2 = imutils.resize(frame2, int(frame.shape[0] * 0.5))
+        if resize_scale != 1:
+            frame2 = imutils.resize(frame2, int(frame.shape[0] * resize_scale))
         # frame2 = cv2.GaussianBlur(frame2, (5, 5), 0)
         frame2 = cv2.medianBlur(frame2, 5)
 
         # cv2.equalizeHist(frame2)
         hist = cv2.calcHist([frame2], [0], None, [256], [0, 256])
         # hist.resize(hist.size)
+        hist += 1
         hist /= hist.sum()
         # hist = hist[128:]
         return np.transpose(hist)
+
+    def compare_feature(self, prev_feature, curr_feature):
+        if prev_feature is None:
+            return 0
+
+        kld = np.sum(kl_div(prev_feature, curr_feature))
+
+        return kld
+
 
     def load_model(self, filename):
         # with open(filename, 'r') as fd:

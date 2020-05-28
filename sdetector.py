@@ -12,6 +12,8 @@ from threading import BoundedSemaphore
 import matplotlib
 import numpy as np
 
+from scenemodel import SceneModel
+
 matplotlib.use('Agg')
 import imutils
 import cv2
@@ -35,7 +37,7 @@ class Config():
     MAX_LEARN_FRAMES = FPS * 3
     MAX_NHISTORY = FPS * 5
     # 1 minute
-    ROI = [495, 0, 924, 680]
+    ROI = [404, 0, 1006, 680]
     VIDEO_ORG_WIDTH = -1
     VIDEO_ORG_HEIGHT = -1
     VIDEO_WIDTH = -1
@@ -45,7 +47,10 @@ class Config():
     TG_CHAT_ID = None
     TG_TOKEN = None
     MAX_IOU = 0.02
-    send_video = True
+    SKIPFRAME = 2
+    RESIZEFRAME = True
+    SCENECHANGE_VALUE = 0.04
+    send_video = False
     statemodel = None
     imagemodel = None
     video_src = None
@@ -228,7 +233,7 @@ class VideoFrame():
     def check_ir(self, frame=None):
         fr = frame if frame is not None else self.frame
         if self.is_ir is None:
-            self.is_ir=is_color(frame, Config.MAX_COLOR_SAMPLES)
+            self.is_ir=is_color(fr, Config.MAX_COLOR_SAMPLES)
         return self.is_ir
 
 
@@ -382,7 +387,7 @@ class StateManager():
     def __write_frames(self, w, h, q):
         th = WriteThread(name=f'WriteThread{len(self.threadlist)}',
                          # args=(q, frame.shape[1], frame.shape[2], 'Object detected', self.pool_sema))
-                         args=(q, w, h, 'Object detected', self.pool_sema))
+                         args=(q, w, h, 'Object detected', 'data/detected/', self.pool_sema))
 
         self.threadlist.append(th)
         th.start()
@@ -451,6 +456,9 @@ class MainController():
         self.alpha = 1
         self.statemanager = StateManager(statemodel, self.max_timeline)
         self.prev_frame_ir = None
+        self.prev_hist=None
+        self.scenemodel=SceneModel()
+
 
     def __learn(self, q):
         learner = LearnModel(self.max_learn_frames)
@@ -464,7 +472,7 @@ class MainController():
 
         # create capture thread
         self.capture_thread = CaptureThread(name='CaptureThread',
-                                            args=(self.q, self.stop_event, self.capture_started_event))
+                                            args=(self.q, self.stop_event, self.capture_started_event, Config.SKIPFRAME, Config.RESIZEFRAME))
         self.capture_thread.start()
 
         logging.info('Waiting for capture starting')
@@ -477,6 +485,8 @@ class MainController():
             logging.info('Building model ...')
             self.__learn(self.q)
 
+        logging.info('Detecting ...')
+
         # fetch frame
         prev_frame = None
         frame = None
@@ -486,7 +496,7 @@ class MainController():
 
             # check if capture thread is running
             if not self.capture_thread.is_alive():
-                logging.info(f'{self.capture_thread.name} is not running')
+                logging.info(f'{self.capture_thread.name} is not running. Nothing we can do.')
                 break
 
             try:
@@ -512,12 +522,23 @@ class MainController():
             #    if light condition is changed, rebuild model
             cur_frame_ir = vframe.check_ir()
             color_changed = self.is_color_changed(cur_frame_ir, frame)
-            if color_changed:
-                logging.info('Video color changed')
+
+            # frame 은 CaptureThread 에서 scale 됨
+            curr_hist=self.scenemodel.extract_feature(frame).transpose()
+            scene_changed = self.scenemodel.compare_feature(self.prev_hist, curr_hist) > Config.SCENECHANGE_VALUE
+
+            self.prev_hist=curr_hist
+            self.prev_frame_ir = cur_frame_ir
+
+            if color_changed or scene_changed:
+                # 새로 learning 을 하므로 이전 정보는 무효
+                self.prev_hist=None
+                self.prev_frame_ir=None
+                logging.info(f'Video {"color" if color_changed else "scene"} changed')
                 # cv2.imwrite('p.jpg', prev_frame)
                 # cv2.imwrite('c.jpg', frame)
                 self.__learn(self.q)
-            self.prev_frame_ir = cur_frame_ir
+
 
             # detect object
             detector = ObjectDetector(self.imagemodel, frame)
@@ -544,7 +565,10 @@ class MainController():
             timelogcount += 1
 
     def is_color_changed(self, cur_frame_ir, frame):
-        return self.prev_frame_ir != None and self.prev_frame_ir != cur_frame_ir
+        if self.prev_frame_ir is None:
+            return False
+
+        return self.prev_frame_ir != cur_frame_ir
 
 
 class SegmentObject():
@@ -712,15 +736,16 @@ class ObjectDetector(SegmentObject):
         frame = vframe.frame
         maxiou = 0
         padding = 25
-        maxheight = 4000
+        margin = 25
+        maxheight = Config.VIDEO_ORG_HEIGHT * 0.5
         for i, (con, iou) in enumerate(zip(self.contours, ious)):
-            x0 = Config.ROI[0] + (padding + 50) * i
-            y0 = Config.ROI[3] - int(maxheight * iou)
-            x1 = x0 + 50
+            x0 = Config.ROI[0] + (padding + margin) * i
+            y0 = Config.ROI[3] - int(maxheight * iou * 3)
+            x1 = x0 + margin
             y1 = Config.ROI[3]
             clr = (255 - i * (255 / len(self.contours)), 0, 0)
             cv2.rectangle(frame, (x0, y0), (x1, y1), clr, -1)
-            cv2.putText(frame, f"{iou:.2f}", (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, clr)
+            cv2.putText(frame, f"{iou:.2f}", (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, clr)
         cv2.drawContours(frame, self.contours, -1, (0, 255, 0), thickness=cv2.FILLED)
         cv2.rectangle(frame, (Config.ROI[0], Config.ROI[1]), (Config.ROI[2], Config.ROI[3]), (220, 220, 220), 2)
         cv2.putText(frame, f'msec: {vframe.createdtime / 1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -756,6 +781,8 @@ class CaptureThread(threading.Thread):
         self.q = args[0]
         self.stop_event = args[1]
         self.capture_started_event = args[2]
+        self.nskipframe=args[3]
+        self.resize=args[4]
 
     def __read_video_params(self, vcap):
 
@@ -767,9 +794,9 @@ class CaptureThread(threading.Thread):
         Config.ROI = (Config.SET_FRAME_SCALE * np.array(Config.ROI)).astype(np.int).tolist()
 
     def run(self):
-        logging.info('connecting to device ...')
+        logging.info(f'Connecting to device f{Config.video_src} ...')
         vcap = cv2.VideoCapture(Config.video_src)
-        logging.info('connected ...')
+        logging.info('Connected.')
 
         fps = FPS()
 
@@ -784,32 +811,35 @@ class CaptureThread(threading.Thread):
         start_msec = datetime.datetime.now().timestamp()
         fps.start()
 
-        frame_skip = 0
+        frame_skip = -1
         while not self.stop_event.wait(0.001):
             ret, frame = vcap.read()
             if not ret:
-                # vcap.release()
-                # vcap = cv2.VideoCapture(Config.video_src)
-                # continue
-                break
+                logging.info('Video decoding error occurred. Restarting capturing.')
+                vcap.release()
+                vcap = cv2.VideoCapture(Config.video_src)
+                continue
 
             if frame is None or len(frame) < 1:
                 self.capture_started_event.clear()
                 break
 
-            if frame_skip % 3 == 0:
-                frame = imutils.resize(frame, Config.VIDEO_WIDTH)
-                vframe = VideoFrame(frame)
-                fps.update()
-
-                self.q.append(vframe)
-                fps.stop()
-                # logging.info(f'input fps : {fps.fps()}')
             frame_skip += 1
+            if self.nskipframe > 0 and frame_skip % self.nskipframe != 0:
+                continue
+
+            if self.resize:
+                frame = imutils.resize(frame, Config.VIDEO_WIDTH)
+            vframe = VideoFrame(frame)
+            fps.update()
+
+            self.q.append(vframe)
+            fps.stop()
+                # logging.info(f'input fps : {fps.fps()}')
 
         vcap.release()
 
-        logging.info("capture stopped")
+        logging.info("Capturing stopped")
 
 
 class WriteThread(threading.Thread):
@@ -820,8 +850,8 @@ class WriteThread(threading.Thread):
         self.name = name
         self.q = args[0]
         self.info = args[3]
-        self.sema = args[4]
-
+        self.writedir = args[4]
+        self.sema = args[5]
     def __estimate_fps(self):
         q = self.q
         fps = 1000. / np.mean(np.diff(np.array([v.createdtime * 1000 for v in q])))
@@ -834,7 +864,7 @@ class WriteThread(threading.Thread):
         # logging.info(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
         s = datetime.datetime.now().replace(microsecond=0).isoformat()
         s = re.sub('[-:]', '', s)
-        fn = 'detected/' + s + ".mp4"
+        fn = self.writedir + s + ".mp4"
 
         logging.info(f'Writing {fn}')
         with self.sema:
@@ -901,7 +931,7 @@ class LearnModel():
         w = Config.VIDEO_WIDTH
         h = Config.VIDEO_HEIGHT
 
-        nsamples = 500
+        nsamples = 100
         widx = np.random.randint(w, size=nsamples)
         hidx = np.random.randint(h, size=nsamples)
 
@@ -911,7 +941,7 @@ class LearnModel():
                 vframe = q.popleft()
                 frame = vframe.frame
             except IndexError:
-                # time.sleep(0.01)
+                time.sleep(0.01)
                 continue
 
             if is_first:

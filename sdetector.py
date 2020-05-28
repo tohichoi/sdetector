@@ -50,7 +50,7 @@ class Config():
     SKIPFRAME = 2
     RESIZEFRAME = True
     SCENECHANGE_VALUE = 0.04
-    send_video = False
+    send_video = True
     statemodel = None
     imagemodel = None
     video_src = None
@@ -336,7 +336,7 @@ class StateManager():
             self.prev_state = self.cur_state
 
         if self.prev_state >= T or self.cur_state >= T:
-            logging.info(f"pseq={''.join(map(lambda x: '1' if x >= T else '0', pseqs))}")
+            logging.info(f"pseq(scale: 1:{1./z:.1f})={''.join(map(lambda x: 'O' if x >= T else '-', pseqs))}")
 
         # np.set_printoptions(precision=2)
         # logging.info(''.join(list(map(lambda x : 'T' if x > T else '.', pseq.tolist()))))
@@ -414,10 +414,11 @@ class StateManager():
         # # object in framebuf lasts < T/2 
         # states=[ f.objstate > 0 for f in self.framebuf ]
         # from back to start, longest segment is larger than T/2
+        validobj = 0
         if pseq is not None:
-            validobj = 0
-            for p in range(len(pseq), 0, -1):
-                if p > T0:
+            # print(pseq)
+            for i in range(len(pseq)-2, 0, -1):
+                if pseq[i] >= T0:
                     validobj += 1
                 else:
                     break
@@ -426,7 +427,7 @@ class StateManager():
                 logging.info(f'validobj={validobj}/{T2}')
                 return FrameWriteMode.IGNORE
 
-            classification['validobj'] = validobj
+        classification['validobj'] = validobj
 
         # Last written time < T 
         now = datetime.datetime.now()

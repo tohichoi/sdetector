@@ -3,7 +3,7 @@
 *.avi
 *.mp4
 data/
-detected/
+data/detected/
 address.txt
 venv/
 config.json

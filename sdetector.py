@@ -1116,16 +1116,9 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-<<<<<<< HEAD
-    if 'OS' in os.environ:
-        if os.environ['OS'] != 'Windows_NT':
-            os.environ['DISPLAY'] = ':1'
-    os.environ['DISPLAY']=':1'
-=======
     if 'OS' in os.environ and os.environ['OS'] != 'Windows_NT':
         os.environ['DISPLAY'] = ':1'
 
->>>>>>> 7339be09eb514dd1535c40e272bdcbb00f928bd7
     # cProfile.run('main(sys.argv)')
 
     main(sys.argv)

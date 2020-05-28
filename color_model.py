@@ -7,6 +7,8 @@ from matplotlib import pyplot as plt
 import random
 from scipy.stats import skewnorm, norm, expon
 import random
+
+
 # from sdetector import VideoFrame
 
 
@@ -50,6 +52,35 @@ np.sum(np.diff(ccdf[0:2, 0:2].astype(np.int16)), axis=2).flatten()
 array([-26, -26, -26, -26])
 '''
 
+'''
+    pwd : ~/Worksapce/sdetector
+    source : ./data/act1/frame-000.jpg
+    dest : ./data/classification-dolor
+    
+    make_symlink(source, dest)
+        
+    ./data/classification-color/frame-000.jpg 
+        points 
+    ./data/act1/frame-000.jpg
+'''
+
+
+def make_symlink(filepath, dname):
+    fn = os.path.basename(filepath)
+    f, e = os.path.splitext(fn)
+    nf = f + '-grayscale' + e
+    path = os.path.join(dname, nf)
+    # cv2.imwrite(path, train_images[j].astype('uint8'))
+    # shutil.copy(filelist[j], dname)
+    s = os.path.relpath(filepath, dname)
+    d = os.path.join(dname, fn)
+    try:
+        os.symlink(s, d)
+    except OSError as e:
+        return False
+
+    return True
+
 
 def get_color_variance(img, nsamples):
     w = img.shape[1]
@@ -70,7 +101,6 @@ def is_color(frame, nsamples):
 
 
 def read_filelist(filename):
-
     filelist = []
     with open(filename) as fd:
         for line in fd.readlines():
@@ -106,12 +136,12 @@ def read_images(filelist):
 
 
 def classify_color():
-
     resultdir = 'data/classification-ccd'
-    if not os.path.exists(resultdir):
-        os.mkdir(resultdir)
+    if os.path.exists(resultdir):
+        shutil.rmtree(resultdir)
+    os.mkdir(resultdir)
 
-    filename='data/filelist-all.txt'
+    filename = 'data/filelist-all.txt'
     # filename = 'data/ccd.txt'
     filelist = read_filelist(filename)
     for i, f in enumerate(filelist):
@@ -121,9 +151,11 @@ def classify_color():
             # dstfile = '../' + os.path.basename(f)
             # os.symlink(dstfile, f)
             # f2=f.replace('/', '\\')
-            shutil.copy(f, resultdir)
+            # shutil.copy(f, resultdir)
             # print(f'{i:03d}/{len(filelist)} : {f}')
+            make_symlink(f, resultdir)
             print(f'{f}')
+
 
 # filelist: './ccd.txt' or './ir.txt'
 def learn(filelist, show_dist=True):

@@ -22,7 +22,7 @@ stop_event = threading.Event()
 stop_event.clear()
 capture_started_event = threading.Event()
 capture_started_event.clear()
-Config.video_src = 'act1.avi'
+Config.video_src = 'data/act1.avi'
 Config.send_video = False
 pool_sema = BoundedSemaphore(value=1)
 

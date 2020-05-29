@@ -268,12 +268,13 @@ class StateManager():
         self.statemodel = statemodel
         self.cur_state = State.UNKNOWN
         self.prev_state = State.UNKNOWN
-        self.framebuf = []
+        # self.framebuf = []
+        self.objstatus=deque()
         self.threadlist = []
         self.nhistorystack = []
         self.pool_sema = BoundedSemaphore(value=1)
         self.last_writing_time = datetime.datetime.today().replace(hour=0, minute=0, second=0)
-        self.write_frame_q = None
+        self.write_frame_q = deque()
         self.timer = None
 
     def stop_writing_thread(self):
@@ -290,6 +291,15 @@ class StateManager():
                 if t.is_alive():
                     logging.info(f'thread : {t.name} is alive')
 
+    def __estimate_seq(self, frame):
+        # seq = np.array([float(frame.objstate) for frame in self.framebuf])
+        seq = self.objstatus
+        wlen = min(13, len(seq))
+        T = 1. / wlen
+        w = np.ones(wlen)
+        pseq = np.convolve(w / w.sum(), seq, mode='same')
+        return pseq, wlen, T
+
     def update_state(self, frame, roi_frame, imagemodel, new_state, color_changed):
         # if len(self.framebuf) < self.nhistory:
         #     self.framebuf.append(VideoFrame(frame, new_state))
@@ -300,26 +310,24 @@ class StateManager():
 
         # if color is changed, write previous frame
         if color_changed:
-            self.__write_sequence(FrameWriteMode.SINGLE, frame)
-            self.nhistory = self.max_nhistory
-            self.framebuf = []
+            # pseq, T=self.__estimate_seq(frame)
+            # writing_mode = self.__determine_writing(pseq, T)
+            # self.__write_sequence(FrameWriteMode.SINGLE, frame)
+            # self.nhistory = self.max_nhistory
+            self.objstatus = []
 
-        while len(self.framebuf) > self.nhistory:
-            self.framebuf.pop(0)
+        # while len(self.framebuf) > self.nhistory:
+        #     self.framebuf.pop(0)
 
-        self.framebuf.append(VideoFrame(frame, new_state))
-
-        nframebuf = len(self.framebuf)
+        # self.framebuf.append(VideoFrame(frame, new_state))
+        self.objstatus.append(new_state)
+        # nframebuf = len(self.framebuf)
         self.cur_state = new_state
 
         # seq=np.array([ str(frame.objstate) for frame in self.framebuf ])
         # pseq=np.array(self.statemodel.predict(seq))
 
-        seq = np.array([float(frame.objstate) for frame in self.framebuf])
-        wlen = min(9, len(self.framebuf))
-        T = 1. / wlen
-        w = np.ones(wlen)
-        pseq = np.convolve(w / w.sum(), seq, mode='same')
+        pseq, wlen, T = self.__estimate_seq(frame)
 
         z = output_disp_size / len(pseq)
         pseqs = interpolation.zoom(pseq, z)
@@ -342,49 +350,43 @@ class StateManager():
             imagemodel = LearnModel.update_model(imagemodel, imageinstance)
         # ABSENT -> PRESENT
         elif self.prev_state < T <= self.cur_state:
+            self.write_frame_q.append(VideoFrame(frame, new_state))
             self.nhistory += 1
         # PRESENT -> PRESENT
         elif self.prev_state >= T and self.cur_state >= T:
+            self.write_frame_q.append(VideoFrame(frame, new_state))
             self.nhistory += 1
         # PRESENT -> ABSENT
         elif self.prev_state >= T > self.cur_state:
             writing_mode = self.__determine_writing(pseq, T)
             self.__write_sequence(writing_mode, frame)
             self.nhistory = self.max_nhistory
-            self.framebuf = []
+            self.objstatus.clear()
 
         return imagemodel
 
     def __write_sequence(self, writing_mode, frame):
         if writing_mode == FrameWriteMode.SINGLE:
             logging.info(f'FrameWriteMode.SINGLE')
-            if self.write_frame_q is None:
-                self.write_frame_q = deque()
-            for f in self.framebuf:
-                self.write_frame_q.append(f)
-            self.timer = threading.Timer(3.0, self.__write_frames,
+            if len(self.write_frame_q) < 1:
+                logging.info(f'Writing queue is empty')
+            else:
+                self.timer = threading.Timer(3.0, self.__write_frames,
                                          args=(frame.shape[1], frame.shape[2], self.write_frame_q))
-            self.timer.start()
+                self.timer.start()
         elif writing_mode == FrameWriteMode.APPEND:
             logging.info(f'FrameWriteMode.APPEND')
-            if self.write_frame_q is None:
-                self.write_frame_q = deque()
-            for f in self.framebuf:
-                self.write_frame_q.append(f)
             if self.timer.is_alive():
                 self.timer.cancel()
             self.timer = threading.Timer(3.0, self.__write_frames,
                                          args=(frame.shape[1], frame.shape[2], self.write_frame_q))
+            self.timer.start()
         elif writing_mode == FrameWriteMode.IGNORE:
             logging.info(f'FrameWriteMode.IGNORE')
-            # if len(self.write_frame_q) > 0:
-            #     logging.info(f'Writing non empty frames')
-            #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
-            if self.write_frame_q is not None:
-                while len(self.write_frame_q) > 0:
-                    self.write_frame_q.popleft()
+            self.timer = threading.Timer(3.0, self.write_frame_q.clear)
+            self.timer.start()
         else:
-            logging.info(f'Unknwon FrameWriteMode : {writing_mode}')
+            logging.info(f'Unknown FrameWriteMode : {writing_mode}')
 
     def __write_frames(self, w, h, q):
         th = WriteThread(name=f'WriteThread{len(self.threadlist)}',
@@ -396,8 +398,6 @@ class StateManager():
 
     def __determine_writing(self, pseq, T0):
 
-        do_write = False
-
         classification = {}
 
         # 2 sec
@@ -407,11 +407,11 @@ class StateManager():
         T3 = 3
 
         # framebuf size < T
-        nframebuf = len(self.framebuf)
-        if nframebuf < T1:
-            logging.info(f'nframebuf={nframebuf}/{T1}')
+        nobjstatus = len(self.objstatus)
+        if nobjstatus < T1:
+            logging.info(f'nobjstatus={nobjstatus}/{T1}')
             return FrameWriteMode.IGNORE
-        classification['nframebuf'] = nframebuf
+        classification['nobjstatus'] = nobjstatus
 
         # # object in framebuf lasts < T/2 
         # states=[ f.objstate > 0 for f in self.framebuf ]
@@ -527,7 +527,7 @@ class MainController():
             color_changed = self.is_color_changed(cur_frame_ir, frame)
 
             # frame 은 CaptureThread 에서 scale 됨
-            curr_hist = self.scenemodel.extract_feature(frame).transpose()
+            curr_hist = self.scenemodel.extract_feature(frame, roi=Config.ROI).transpose()
             scene_changed = self.scenemodel.compare_feature(self.prev_hist, curr_hist) > Config.SCENECHANGE_VALUE
 
             self.prev_hist = curr_hist
@@ -753,9 +753,9 @@ class ObjectDetector(SegmentObject):
             cv2.putText(frame, f"{iou:.2f}", (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, clr)
             cv2.drawContours(frame, self.contours, i, self.palette[i % len(self.palette)], thickness=cv2.FILLED)
         cv2.rectangle(frame, (Config.ROI[0], Config.ROI[1]), (Config.ROI[2], Config.ROI[3]), (220, 220, 220), 2)
-        cv2.putText(frame, f'msec: {vframe.createdtime / 1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 255, 0))
-        cv2.putText(frame, f'iframes: {vframe.iframes}', (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
+        # cv2.putText(frame, f'msec: {vframe.createdtime / 1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+        #             (255, 255, 0))
+        # cv2.putText(frame, f'iframes: {vframe.iframes}', (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0))
 
     def __bb_intersection_over_union(self, boxA, boxB):
         # determine the (x, y)-coordinates of the intersection rectangle
@@ -932,19 +932,29 @@ class LearnModel():
 
         return ret
 
-    def wait_for_stable(self, q, q_window_name=None):
+    def __get_sample_index(self, width=0, height=0):
+
+        w = Config.VIDEO_WIDTH if width == 0 else width
+        h = Config.VIDEO_HEIGHT if height == 0 else height
+
+        nsamples = Config.MAX_COLOR_SAMPLES
+        widx = np.random.randint(w, size=nsamples)
+        hidx = np.random.randint(h, size=nsamples)
+
+        return widx, hidx
+
+    def __mse(self, cur_frame, prev_frame):
+        mse = ((cur_frame - prev_frame) ** 2).mean(axis=None)
+        return mse
+
+    def wait_for_stable(self, q, q_window_name=None, maxwait=0):
         prev_frame = None
         is_first = True
         stability = 0
-        maxlen = int(Config.FPS * 3)
+        maxlen = int(Config.FPS * 3) if maxwait == 0 else maxwait
         dq = deque([], maxlen)
 
-        w = Config.VIDEO_WIDTH
-        h = Config.VIDEO_HEIGHT
-
-        nsamples = 100
-        widx = np.random.randint(w, size=nsamples)
-        hidx = np.random.randint(h, size=nsamples)
+        widx, hidx=self.__get_sample_index()
 
         # nskip=1
         while True:
@@ -961,7 +971,7 @@ class LearnModel():
                 continue
             # if nskip % 5 == 0:
             # mse=((frame[hidx, widx[:nsamples], :] - prev_frame[hidx[:nsamples], widx[:nsamples], :]) ** 2).mean(axis=None)
-            mse = ((frame[hidx, widx, :] - prev_frame[hidx, widx, :]) ** 2).mean(axis=None)
+            mse=self.__mse(frame[hidx, widx, :], prev_frame[hidx, widx, :])
             dq.append(mse)
             prev_frame = frame
             # logging.info('fetch frame')
@@ -974,8 +984,8 @@ class LearnModel():
                 else:
                     stability = 0
 
-                if stability > 10:
-                    return
+                if stability > 5:
+                    return stability
             # nskip+=1
 
             if q_window_name:
@@ -993,6 +1003,8 @@ class LearnModel():
         logging.info('learning ... ')
         ref_count = 0
         alpha = 0
+        widx, hidx=self.__get_sample_index(width(Config.ROI), height(Config.ROI))
+
         while ref_count < self.n:
             try:
                 vframe = q.popleft()
@@ -1011,6 +1023,11 @@ class LearnModel():
                 continue
 
             imageinstance = ImageModel(frame_gray, None)
+
+            if self.__mse(imageinstance.pixel[hidx, widx], imagemodel.pixel[hidx, widx]) > 40:
+                logging.info(f'Frame is not stable.')
+                ref_count=1
+                continue
 
             imagemodel.alpha = 1. / ref_count
             imagemodel = LearnModel.update_model(imagemodel, imageinstance)

@@ -33,8 +33,8 @@ class Config():
     SET_FRAME_SCALE = 0.5
     # 20 frames/sec * 30sec
     MAX_CAPTURE_BUFFER = FPS * 60
-    MAX_TIMELINE = 5 * FPS
-    MAX_LEARN_FRAMES = FPS * 3
+    MAX_TIMELINE = 3 * FPS
+    MAX_LEARN_FRAMES = FPS * 2
     MAX_NHISTORY = FPS * 5
     # 1 minute
     ROI = [404, 0, 1006, 680]
@@ -296,16 +296,11 @@ class StateManager():
         #     # imagemodel=LearnModel.update_model(imagemodel, roi_frame, alpha)
         #     return imagemodel
 
-        output_disp_size = 50
+        output_disp_size = 40
 
         # if color is changed, write previous frame
-        if color_changed and self.__determine_writing(None, None) in [FrameWriteMode.SINGLE, FrameWriteMode.APPEND]:
-            if self.write_frame_q is None:
-                self.write_frame_q=Queue()
-                for f in self.framebuf:
-                    self.write_frame_q.put(f)
-            self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
         if color_changed:
+            self.__write_sequence(FrameWriteMode.SINGLE, frame)
             self.nhistory = self.max_nhistory
             self.framebuf = []
 
@@ -354,35 +349,42 @@ class StateManager():
         # PRESENT -> ABSENT
         elif self.prev_state >= T > self.cur_state:
             writing_mode = self.__determine_writing(pseq, T)
-            if writing_mode == FrameWriteMode.SINGLE:
-                logging.info(f'FrameWriteMode.SINGLE')
-                self.write_frame_q = deque()
-                for f in self.framebuf:
-                    self.write_frame_q.append(f)
-                self.timer = threading.Timer(3.0, self.__write_frames,
-                                             args=(frame.shape[1], frame.shape[2], self.write_frame_q))
-                self.timer.start()
-            elif writing_mode == FrameWriteMode.APPEND:
-                logging.info(f'FrameWriteMode.APPEND')
-                for f in self.framebuf:
-                    self.write_frame_q.append(f)
-                if self.timer.is_alive():
-                    self.timer.cancel()
-                self.timer = threading.Timer(3.0, self.__write_frames,
-                                             args=(frame.shape[1], frame.shape[2], self.write_frame_q))
-            elif writing_mode == FrameWriteMode.IGNORE:
-                logging.info(f'FrameWriteMode.IGNORE')
-                # if len(self.write_frame_q) > 0:
-                #     logging.info(f'Writing non empty frames')
-                #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
-                if self.write_frame_q is not None:
-                    while len(self.write_frame_q) > 0:
-                        self.write_frame_q.popleft()
-
+            self.__write_sequence(writing_mode, frame)
             self.nhistory = self.max_nhistory
             self.framebuf = []
 
         return imagemodel
+
+    def __write_sequence(self, writing_mode, frame):
+        if writing_mode == FrameWriteMode.SINGLE:
+            logging.info(f'FrameWriteMode.SINGLE')
+            if self.write_frame_q is None:
+                self.write_frame_q = deque()
+            for f in self.framebuf:
+                self.write_frame_q.append(f)
+            self.timer = threading.Timer(3.0, self.__write_frames,
+                                         args=(frame.shape[1], frame.shape[2], self.write_frame_q))
+            self.timer.start()
+        elif writing_mode == FrameWriteMode.APPEND:
+            logging.info(f'FrameWriteMode.APPEND')
+            if self.write_frame_q is None:
+                self.write_frame_q = deque()
+            for f in self.framebuf:
+                self.write_frame_q.append(f)
+            if self.timer.is_alive():
+                self.timer.cancel()
+            self.timer = threading.Timer(3.0, self.__write_frames,
+                                         args=(frame.shape[1], frame.shape[2], self.write_frame_q))
+        elif writing_mode == FrameWriteMode.IGNORE:
+            logging.info(f'FrameWriteMode.IGNORE')
+            # if len(self.write_frame_q) > 0:
+            #     logging.info(f'Writing non empty frames')
+            #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
+            if self.write_frame_q is not None:
+                while len(self.write_frame_q) > 0:
+                    self.write_frame_q.popleft()
+        else:
+            logging.info(f'Unknwon FrameWriteMode : {writing_mode}')
 
     def __write_frames(self, w, h, q):
         th = WriteThread(name=f'WriteThread{len(self.threadlist)}',
@@ -423,11 +425,11 @@ class StateManager():
                 else:
                     break
 
-            if validobj < T2:
-                logging.info(f'validobj={validobj}/{T2}')
-                return FrameWriteMode.IGNORE
+        if validobj < T2:
+            logging.info(f'validobj={validobj}/{T2}')
+            return FrameWriteMode.IGNORE
 
-        classification['validobj'] = validobj
+        # classification['validobj'] = validobj
 
         # Last written time < T 
         now = datetime.datetime.now()
@@ -536,7 +538,7 @@ class MainController():
                 self.prev_hist = None
                 self.prev_frame_ir = None
                 logging.info(f'Video {"color" if color_changed else "scene"} changed')
-                s=WriteThread.get_current_timestring()
+                s = WriteThread.get_current_timestring()
                 cv2.imwrite(f'{s}-prev.jpg', prev_frame)
                 cv2.imwrite(f'{s}-curr.jpg', frame)
                 self.__learn(self.q)
@@ -589,6 +591,7 @@ class SegmentObject():
     def get_gray_image(frame):
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         # frame_gray=cv2.equalizeHist(frame_gray, 256)
+        frame_gray = cv2.equalizeHist(frame_gray)
         frame_gray = cv2.GaussianBlur(frame_gray, (5, 5), 0)
 
         return frame_gray
@@ -604,7 +607,7 @@ class SegmentObject():
         # otsu
         # _, difference_t=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
         # global threshold
-        _, difference_t = cv2.threshold(difference, 50, 255, cv2.THRESH_BINARY)
+        _, difference_t = cv2.threshold(difference, 40, 255, cv2.THRESH_BINARY)
         # adaptive
         # difference_t=cv2.adaptiveThreshold(difference, 255, cv2.ADAPTIVE_THRESqH_MEAN_C, cv2.THRESH_BINARY,11,2)
         # cv2.imshow('difference:threshold', difference)
@@ -613,7 +616,7 @@ class SegmentObject():
 
         kernel = np.ones((7, 7), np.uint8)
         # Morphological Closing -> Morphological Opening
-        difference_t = cv2.morphologyEx(difference_t, cv2.MORPH_CLOSE, kernel, iterations=5)
+        difference_t = cv2.morphologyEx(difference_t, cv2.MORPH_CLOSE, kernel, iterations=2)
         # difference_t = cv2.morphologyEx(difference_t, cv2.MORPH_OPEN, kernel, iterations=1)
 
         show_frame(threshold=difference_t, difference=difference)
@@ -796,7 +799,7 @@ class CaptureThread(threading.Thread):
         Config.ROI = (Config.SET_FRAME_SCALE * np.array(Config.ROI)).astype(np.int).tolist()
 
     def run(self):
-        logging.info(f'Connecting to device f{Config.video_src} ...')
+        logging.info(f'Connecting to device {Config.video_src} ...')
         vcap = cv2.VideoCapture(Config.video_src)
         logging.info('Connected.')
 
@@ -855,13 +858,11 @@ class WriteThread(threading.Thread):
         self.writedir = args[4]
         self.sema = args[5]
 
-
     @staticmethod
     def get_current_timestring():
         s = datetime.datetime.now().replace(microsecond=0).isoformat()
         s = re.sub('[-:]', '', s)
         return s
-
 
     def __estimate_fps(self):
         q = self.q
@@ -873,7 +874,7 @@ class WriteThread(threading.Thread):
         n = len(self.q)
 
         # logging.info(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
-        s=self.get_current_timestring()
+        s = self.get_current_timestring()
         fn = self.writedir + s + ".mp4"
 
         logging.info(f'Writing {fn}')
@@ -935,7 +936,7 @@ class LearnModel():
         prev_frame = None
         is_first = True
         stability = 0
-        maxlen = int(Config.FPS * 5)
+        maxlen = int(Config.FPS * 3)
         dq = deque([], maxlen)
 
         w = Config.VIDEO_WIDTH

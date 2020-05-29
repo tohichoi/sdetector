@@ -299,12 +299,12 @@ class StateManager():
         output_disp_size = 50
 
         # if color is changed, write previous frame
-        # if color_changed and self.__determine_writing(None, None) in [FrameWriteMode.SINGLE, FrameWriteMode.APPEND]:
-        #     if self.write_frame_q is None:
-        #         self.write_frame_q=Queue()
-        #         for f in self.framebuf:
-        #             self.write_frame_q.put(f)
-        #     self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
+        if color_changed and self.__determine_writing(None, None) in [FrameWriteMode.SINGLE, FrameWriteMode.APPEND]:
+            if self.write_frame_q is None:
+                self.write_frame_q=Queue()
+                for f in self.framebuf:
+                    self.write_frame_q.put(f)
+            self.__write_frames(frame.shape[1], frame.shape[2], self.write_frame_q)
         if color_changed:
             self.nhistory = self.max_nhistory
             self.framebuf = []
@@ -400,7 +400,7 @@ class StateManager():
 
         # 2 sec
         T1 = Config.FPS
-        T2 = T1
+        T2 = T1 / 8
         # 30 seconds
         T3 = 3
 
@@ -536,8 +536,9 @@ class MainController():
                 self.prev_hist = None
                 self.prev_frame_ir = None
                 logging.info(f'Video {"color" if color_changed else "scene"} changed')
-                # cv2.imwrite('p.jpg', prev_frame)
-                # cv2.imwrite('c.jpg', frame)
+                s=WriteThread.get_current_timestring()
+                cv2.imwrite(f'{s}-prev.jpg', prev_frame)
+                cv2.imwrite(f'{s}-curr.jpg', frame)
                 self.__learn(self.q)
 
             # detect object
@@ -554,7 +555,7 @@ class MainController():
             # if cv2.waitKey(Config.WAITKEY_MS)==ord('q'):
             #     self.stop_event.set()
             #     break
-            self.__determine_action(frame, roi_frame, detect_result, color_changed)
+            self.__determine_action(frame, roi_frame, detect_result, color_changed or scene_changed)
 
             now = datetime.datetime.now()
             c = datetime.datetime.fromtimestamp(vframe.createdtime)
@@ -854,6 +855,14 @@ class WriteThread(threading.Thread):
         self.writedir = args[4]
         self.sema = args[5]
 
+
+    @staticmethod
+    def get_current_timestring():
+        s = datetime.datetime.now().replace(microsecond=0).isoformat()
+        s = re.sub('[-:]', '', s)
+        return s
+
+
     def __estimate_fps(self):
         q = self.q
         fps = 1000. / np.mean(np.diff(np.array([v.createdtime * 1000 for v in q])))
@@ -864,8 +873,7 @@ class WriteThread(threading.Thread):
         n = len(self.q)
 
         # logging.info(f'{threading.get_ident()} write_framebuf started : {self.q.qsize()}')
-        s = datetime.datetime.now().replace(microsecond=0).isoformat()
-        s = re.sub('[-:]', '', s)
+        s=self.get_current_timestring()
         fn = self.writedir + s + ".mp4"
 
         logging.info(f'Writing {fn}')

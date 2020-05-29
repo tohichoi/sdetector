@@ -50,7 +50,7 @@ class Config():
     SKIPFRAME = 2
     RESIZEFRAME = True
     SCENECHANGE_VALUE = 0.04
-    send_video = True
+    send_video = False
     statemodel = None
     imagemodel = None
     video_src = None
@@ -233,7 +233,7 @@ class VideoFrame():
     def check_ir(self, frame=None):
         fr = frame if frame is not None else self.frame
         if self.is_ir is None:
-            self.is_ir=is_color(fr, Config.MAX_COLOR_SAMPLES)
+            self.is_ir = is_color(fr, Config.MAX_COLOR_SAMPLES)
         return self.is_ir
 
 
@@ -336,7 +336,7 @@ class StateManager():
             self.prev_state = self.cur_state
 
         if self.prev_state >= T or self.cur_state >= T:
-            logging.info(f"pseq(scale: 1:{1./z:.1f})={''.join(map(lambda x: 'O' if x >= T else '-', pseqs))}")
+            logging.info(f"pseq(scale: 1:{1. / z:.1f})={''.join(map(lambda x: 'O' if x >= T else '-', pseqs))}")
 
         # np.set_printoptions(precision=2)
         # logging.info(''.join(list(map(lambda x : 'T' if x > T else '.', pseq.tolist()))))
@@ -417,7 +417,7 @@ class StateManager():
         validobj = 0
         if pseq is not None:
             # print(pseq)
-            for i in range(len(pseq)-2, 0, -1):
+            for i in range(len(pseq) - 2, 0, -1):
                 if pseq[i] >= T0:
                     validobj += 1
                 else:
@@ -457,9 +457,8 @@ class MainController():
         self.alpha = 1
         self.statemanager = StateManager(statemodel, self.max_timeline)
         self.prev_frame_ir = None
-        self.prev_hist=None
-        self.scenemodel=SceneModel()
-
+        self.prev_hist = None
+        self.scenemodel = SceneModel()
 
     def __learn(self, q):
         learner = LearnModel(self.max_learn_frames)
@@ -473,7 +472,8 @@ class MainController():
 
         # create capture thread
         self.capture_thread = CaptureThread(name='CaptureThread',
-                                            args=(self.q, self.stop_event, self.capture_started_event, Config.SKIPFRAME, Config.RESIZEFRAME))
+                                            args=(self.q, self.stop_event, self.capture_started_event, Config.SKIPFRAME,
+                                                  Config.RESIZEFRAME))
         self.capture_thread.start()
 
         logging.info('Waiting for capture starting')
@@ -525,21 +525,20 @@ class MainController():
             color_changed = self.is_color_changed(cur_frame_ir, frame)
 
             # frame 은 CaptureThread 에서 scale 됨
-            curr_hist=self.scenemodel.extract_feature(frame).transpose()
+            curr_hist = self.scenemodel.extract_feature(frame).transpose()
             scene_changed = self.scenemodel.compare_feature(self.prev_hist, curr_hist) > Config.SCENECHANGE_VALUE
 
-            self.prev_hist=curr_hist
+            self.prev_hist = curr_hist
             self.prev_frame_ir = cur_frame_ir
 
             if color_changed or scene_changed:
                 # 새로 learning 을 하므로 이전 정보는 무효
-                self.prev_hist=None
-                self.prev_frame_ir=None
+                self.prev_hist = None
+                self.prev_frame_ir = None
                 logging.info(f'Video {"color" if color_changed else "scene"} changed')
                 # cv2.imwrite('p.jpg', prev_frame)
                 # cv2.imwrite('c.jpg', frame)
                 self.__learn(self.q)
-
 
             # detect object
             detector = ObjectDetector(self.imagemodel, frame)
@@ -602,20 +601,19 @@ class SegmentObject():
         # cv2.imshow('difference:absdiff', difference)
 
         # otsu
-        # _, difference=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        # _, difference_t=cv2.threshold(difference, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
         # global threshold
-        _, difference_t = cv2.threshold(difference, 35, 255, cv2.THRESH_BINARY)
+        _, difference_t = cv2.threshold(difference, 50, 255, cv2.THRESH_BINARY)
         # adaptive
-        # difference=cv2.adaptiveThreshold(difference, 255, cv2.ADAPTIVE_THRESH_MEAN_C,\
-        #     cv2.THRESH_BINARY,11,2)
+        # difference_t=cv2.adaptiveThreshold(difference, 255, cv2.ADAPTIVE_THRESqH_MEAN_C, cv2.THRESH_BINARY,11,2)
         # cv2.imshow('difference:threshold', difference)
 
-        # difference=cv2.adaptiveThreshold(difference, 245, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 0)
+        # difference_t=cv2.adaptiveThreshold(difference, 245, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 0)
 
         kernel = np.ones((7, 7), np.uint8)
-        difference_t = cv2.dilate(difference_t, kernel)
-        kernel = np.ones((5, 5), np.uint8)
-        difference_t = cv2.erode(difference_t, kernel)
+        # Morphological Closing -> Morphological Opening
+        difference_t = cv2.morphologyEx(difference_t, cv2.MORPH_CLOSE, kernel, iterations=5)
+        # difference_t = cv2.morphologyEx(difference_t, cv2.MORPH_OPEN, kernel, iterations=1)
 
         show_frame(threshold=difference_t, difference=difference)
 
@@ -659,6 +657,8 @@ class SegmentObject():
 class ObjectDetector(SegmentObject):
     def __init__(self, imagemodel, frame):
         super(ObjectDetector, self).__init__(imagemodel, frame)
+        self.palette = [(0x64, 0xb5, 0xf6), (0x82, 0xe9, 0xde), (0xff, 0xb7, 0x4d), (0xba, 0x68, 0xc8),
+                        (0xde, 0xe7, 0x75)]
 
     # draw_frame : VideoFrame
     def detect(self, draw_frame=None):
@@ -713,9 +713,9 @@ class ObjectDetector(SegmentObject):
             # METHOD2 contour area
             #  1. smoothing
             #  2. find area
-            wlen = 9
-            T = 1. / wlen
-            w = np.ones(wlen)
+            # wlen = 9
+            # T = 1. / wlen
+            # w = np.ones(wlen)
             # x
 
             con2 = con
@@ -747,7 +747,7 @@ class ObjectDetector(SegmentObject):
             clr = (255 - i * (255 / len(self.contours)), 0, 0)
             cv2.rectangle(frame, (x0, y0), (x1, y1), clr, -1)
             cv2.putText(frame, f"{iou:.2f}", (x0, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, clr)
-        cv2.drawContours(frame, self.contours, -1, (0, 255, 0), thickness=cv2.FILLED)
+            cv2.drawContours(frame, self.contours, i, self.palette[i % len(self.palette)], thickness=cv2.FILLED)
         cv2.rectangle(frame, (Config.ROI[0], Config.ROI[1]), (Config.ROI[2], Config.ROI[3]), (220, 220, 220), 2)
         cv2.putText(frame, f'msec: {vframe.createdtime / 1000.:.0f}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 0))
@@ -782,8 +782,8 @@ class CaptureThread(threading.Thread):
         self.q = args[0]
         self.stop_event = args[1]
         self.capture_started_event = args[2]
-        self.nskipframe=args[3]
-        self.resize=args[4]
+        self.nskipframe = args[3]
+        self.resize = args[4]
 
     def __read_video_params(self, vcap):
 
@@ -836,7 +836,7 @@ class CaptureThread(threading.Thread):
 
             self.q.append(vframe)
             fps.stop()
-                # logging.info(f'input fps : {fps.fps()}')
+            # logging.info(f'input fps : {fps.fps()}')
 
         vcap.release()
 
@@ -853,6 +853,7 @@ class WriteThread(threading.Thread):
         self.info = args[3]
         self.writedir = args[4]
         self.sema = args[5]
+
     def __estimate_fps(self):
         q = self.q
         fps = 1000. / np.mean(np.diff(np.array([v.createdtime * 1000 for v in q])))

@@ -120,7 +120,8 @@ class SceneModel():
             features.append(self.extract_feature(f))
         return features
 
-    def extract_feature(self, frame, resize_scale=1, roi=None):
+    @staticmethod
+    def extract_feature(frame, resize_scale=1, roi=None):
         frame2 = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         if resize_scale != 1:
             frame2 = imutils.resize(frame2, int(frame.shape[0] * resize_scale))
@@ -130,9 +131,12 @@ class SceneModel():
         # cv2.equalizeHist(frame2)
         mask=None
         if roi is not None:
-            mask_bg=np.ones_like(frame2)*255
-            mask_bg[roi[1]:roi[3], roi[0]:roi[2]]=0
-            mask=mask_bg.astype('uint8')
+            if type(roi) == list:
+                mask_bg=np.ones_like(frame2)*255
+                mask_bg[roi[1]:roi[3], roi[0]:roi[2]]=0
+                mask=mask_bg.astype('uint8')
+            elif type(roi) == np.ndarray:
+                mask=roi
 
         hist = cv2.calcHist([frame2], [0], mask, [256], [0, 256])
         # hist.resize(hist.size)

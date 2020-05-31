@@ -13,6 +13,7 @@ import logging
 import time
 import datetime
 import os
+import sys
 from threading import BoundedSemaphore
 
 # matplotlib.use('GTK3Agg')
@@ -25,12 +26,14 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+Config.video_src=sys.argv[1]
+
 read_queue = deque()
 stop_event = threading.Event()
 stop_event.clear()
 capture_started_event = threading.Event()
 capture_started_event.clear()
-Config.video_src = 'data/act4.avi'
+# Config.video_src = 'data/act4.avi'
 Config.send_video = False
 pool_sema = BoundedSemaphore(value=1)
 
@@ -56,13 +59,15 @@ count = 0
 while True:
 
     # check if capture thread is running
-    if not capture_thread.is_alive():
-        logging.info(f'{capture_thread.name} is not running')
-        break
+    # if not capture_thread.is_alive():
+    #     logging.info(f'{capture_thread.name} is not running')
+    #     break
 
     # try:
     if len(read_queue) < 1:
-        time.sleep(0.01)
+        if not capture_thread.is_alive():
+            break
+        time.sleep(1)
         continue
 
     vframe = read_queue.popleft()

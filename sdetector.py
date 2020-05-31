@@ -49,7 +49,7 @@ class Config():
     MAX_IOU = 0.02
     SKIPFRAME = 2
     RESIZEFRAME = True
-    SCENECHANGE_VALUE = 0.04
+    SCENECHANGE_VALUE = 0.08
     send_video = False
     statemodel = None
     imagemodel = None
@@ -822,8 +822,9 @@ class CaptureThread(threading.Thread):
             if not ret:
                 logging.info('Video decoding error occurred. Restarting capturing.')
                 vcap.release()
-                vcap = cv2.VideoCapture(Config.video_src)
-                continue
+                break
+                # vcap = cv2.VideoCapture(Config.video_src)
+                # continue
 
             if frame is None or len(frame) < 1:
                 self.capture_started_event.clear()
